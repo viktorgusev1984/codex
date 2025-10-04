@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::borrow::ToOwned;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::Path;
@@ -30,6 +31,7 @@ use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
 use futures::prelude::*;
 use mcp_types::CallToolResult;
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json;
@@ -58,6 +60,7 @@ use crate::environment_context::EnvironmentContext;
 use crate::error::CodexErr;
 use crate::error::Result as CodexResult;
 use crate::error::SandboxErr;
+use crate::error::UnexpectedResponseError;
 use crate::error::get_error_message_ui;
 use crate::exec::ExecParams;
 use crate::exec::ExecToolCallOutput;
@@ -1937,37 +1940,74 @@ async fn run_turn(
                 return Err(CodexErr::UsageLimitReached(e));
             }
             Err(CodexErr::UsageNotIncluded) => return Err(CodexErr::UsageNotIncluded),
-            Err(e) => {
-                // Use the configured provider-specific stream retry budget.
-                let max_retries = turn_context.client.get_provider().stream_max_retries();
-                if retries < max_retries {
-                    retries += 1;
-                    let delay = match e {
-                        CodexErr::Stream(_, Some(delay)) => delay,
-                        _ => backoff(retries),
-                    };
-                    warn!(
-                        "stream disconnected - retrying turn ({retries}/{max_retries} in {delay:?})...",
-                    );
+            Err(error) => {
+                if should_retry_turn_error(&error) {
+                    // Use the configured provider-specific stream retry budget.
+                    let max_retries = turn_context.client.get_provider().stream_max_retries();
+                    if retries < max_retries {
+                        retries += 1;
+                        let delay = match &error {
+                            CodexErr::Stream(_, Some(delay)) => *delay,
+                            _ => backoff(retries),
+                        };
+                        warn!(
+                            "stream disconnected - retrying turn ({retries}/{max_retries} in {delay:?})...",
+                        );
 
-                    // Surface retry information to any UI/front‑end so the
-                    // user understands what is happening instead of staring
-                    // at a seemingly frozen screen.
-                    sess.notify_stream_error(
-                        &sub_id,
-                        format!(
-                            "stream error: {e}; retrying {retries}/{max_retries} in {delay:?}…"
-                        ),
-                    )
-                    .await;
+                        // Surface retry information to any UI/front‑end so the
+                        // user understands what is happening instead of staring
+                        // at a seemingly frozen screen.
+                        sess.notify_stream_error(
+                            &sub_id,
+                            format!(
+                                "stream error: {error}; retrying {retries}/{max_retries} in {delay:?}…"
+                            ),
+                        )
+                        .await;
 
-                    tokio::time::sleep(delay).await;
+                        tokio::time::sleep(delay).await;
+                    } else {
+                        return Err(error);
+                    }
                 } else {
-                    return Err(e);
+                    return Err(error);
                 }
             }
         }
     }
+}
+
+fn should_retry_turn_error(error: &CodexErr) -> bool {
+    match error {
+        CodexErr::Stream(_, _) => true,
+        CodexErr::UnexpectedStatus(err) => should_retry_bad_request(err),
+        _ => false,
+    }
+}
+
+fn should_retry_bad_request(err: &UnexpectedResponseError) -> bool {
+    if err.status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+
+    let Some(message) = extract_error_message(&err.body) else {
+        return false;
+    };
+
+    let message = message.to_ascii_lowercase();
+    message.contains("expecting ',' delimiter")
+        || message.contains("unexpected end of json input")
+        || message.contains("eof while parsing")
+        || message.contains("unterminated string")
+}
+
+fn extract_error_message(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    value
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
 }
 
 /// When the model is prompted, it returns a stream of events. Some of these
@@ -3322,6 +3362,7 @@ mod tests {
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
 
+    use super::StatusCode;
     use mcp_types::ContentBlock;
     use mcp_types::TextContent;
     use pretty_assertions::assert_eq;
@@ -3494,6 +3535,36 @@ mod tests {
             out,
             "command timed out after 1000 milliseconds\nCommand output"
         );
+    }
+
+    #[test]
+    fn retry_bad_request_when_tool_arguments_truncated() {
+        let err = UnexpectedResponseError {
+            status: StatusCode::BAD_REQUEST,
+            body:
+                "{\"error\":{\"message\":\"Expecting ',' delimiter: line 1 column 60 (char 59)\"}}"
+                    .to_string(),
+            request_id: None,
+        };
+
+        assert!(should_retry_bad_request(&err));
+
+        let codex_err = CodexErr::UnexpectedStatus(err);
+        assert!(should_retry_turn_error(&codex_err));
+    }
+
+    #[test]
+    fn does_not_retry_unrelated_bad_request() {
+        let err = UnexpectedResponseError {
+            status: StatusCode::BAD_REQUEST,
+            body: "{\"error\":{\"message\":\"Unknown parameter\"}}".to_string(),
+            request_id: None,
+        };
+
+        assert!(!should_retry_bad_request(&err));
+
+        let codex_err = CodexErr::UnexpectedStatus(err);
+        assert!(!should_retry_turn_error(&codex_err));
     }
 
     #[test]
