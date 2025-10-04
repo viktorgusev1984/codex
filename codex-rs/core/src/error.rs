@@ -4,6 +4,7 @@ use crate::token_data::PlanType;
 use codex_protocol::ConversationId;
 use codex_protocol::protocol::RateLimitSnapshot;
 use reqwest::StatusCode;
+use reqwest::header::HeaderMap;
 use serde_json;
 use std::io;
 use std::time::Duration;
@@ -162,19 +163,27 @@ impl std::error::Error for UnexpectedResponseError {}
 pub struct RetryLimitReachedError {
     pub status: StatusCode,
     pub request_id: Option<String>,
+    pub body: Option<String>,
+    pub headers: Option<HeaderMap>,
 }
 
 impl std::fmt::Display for RetryLimitReachedError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "exceeded retry limit, last status: {}{}",
-            self.status,
-            self.request_id
-                .as_ref()
-                .map(|id| format!(", request id: {id}"))
-                .unwrap_or_default()
-        )
+        write!(f, "exceeded retry limit, last status: {}", self.status)?;
+
+        if let Some(request_id) = &self.request_id {
+            write!(f, ", request id: {request_id}")?;
+        }
+
+        if let Some(body) = &self.body {
+            write!(f, ", body: {body}")?;
+        }
+
+        if let Some(headers) = &self.headers {
+            write!(f, ", headers: {:?}", headers)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -311,6 +320,8 @@ pub fn get_error_message_ui(e: &CodexErr) -> String {
 mod tests {
     use super::*;
     use codex_protocol::protocol::RateLimitWindow;
+    use reqwest::header::HeaderMap;
+    use reqwest::header::HeaderValue;
 
     fn rate_limit_snapshot() -> RateLimitSnapshot {
         RateLimitSnapshot {
@@ -455,5 +466,25 @@ mod tests {
             err.to_string(),
             "You've hit your usage limit. Try again in less than a minute."
         );
+    }
+
+    #[test]
+    fn retry_limit_error_includes_details() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-test", HeaderValue::from_static("value"));
+
+        let err = RetryLimitReachedError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            request_id: Some("abc123".to_string()),
+            body: Some("{\"error\":\"rate limited\"}".to_string()),
+            headers: Some(headers.clone()),
+        };
+
+        let formatted = err.to_string();
+        assert!(formatted.contains("request id: abc123"));
+        assert!(formatted.contains("body: {\"error\":\"rate limited\"}"));
+        assert!(formatted.contains("headers:"));
+        assert!(formatted.contains("\"x-test\""));
+        assert!(formatted.contains("\"value\""));
     }
 }

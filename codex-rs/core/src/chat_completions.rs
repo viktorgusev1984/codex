@@ -333,6 +333,8 @@ pub(crate) async fn stream_chat_completions(
                     return Err(CodexErr::RetryLimit(RetryLimitReachedError {
                         status,
                         request_id: None,
+                        body: None,
+                        headers: None,
                     }));
                 }
 
