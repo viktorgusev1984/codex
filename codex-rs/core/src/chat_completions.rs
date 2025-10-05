@@ -641,10 +641,21 @@ async fn process_chat_sse<S>(
                         }
 
                         // Then emit the FunctionCall response item.
+                        let mut arguments = fn_call_state.arguments.clone();
+                        // Some providers stream the closing brace outside of the deltas
+                        // and only include it in the terminal message payload. If that is
+                        // missing, ensure the JSON object is closed so downstream parsers
+                        // do not fail on `EOF while parsing an object`.
+                        if arguments.trim_start().starts_with('{')
+                            && !arguments.trim_end().ends_with('}')
+                        {
+                            arguments.push('}');
+                        }
+
                         let item = ResponseItem::FunctionCall {
                             id: None,
                             name: fn_call_state.name.clone().unwrap_or_else(|| "".to_string()),
-                            arguments: fn_call_state.arguments.clone(),
+                            arguments,
                             call_id: fn_call_state.call_id.clone().unwrap_or_else(String::new),
                         };
 
