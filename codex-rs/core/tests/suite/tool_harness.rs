@@ -242,7 +242,7 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
 
     let call_id = "plan-tool-invalid";
     let invalid_args = json!({
-        "explanation": "Missing plan data"
+        "plan": "Create docs directory structure"
     })
     .to_string();
 
@@ -316,8 +316,8 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
         "expected parse error message in output text, got {output_text:?}"
     );
     assert!(
-        output_text.contains("Ensure `plan` is an array of objects"),
-        "expected guidance about the plan format in output text, got {output_text:?}"
+        output_text.contains("Wrap the plan steps in an array of objects"),
+        "expected guidance about wrapping plan steps in output text, got {output_text:?}"
     );
     if let Some(success_flag) = output_item
         .get("output")
