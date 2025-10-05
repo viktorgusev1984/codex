@@ -14,7 +14,6 @@ use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::ConversationId;
 use core_test_support::load_default_config_for_test;
 use futures::StreamExt;
-use serde_json::json;
 use tempfile::TempDir;
 use wiremock::Mock;
 use wiremock::MockServer;
@@ -377,7 +376,7 @@ async fn streams_legacy_function_call_delta() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tool_call_arguments_may_continue_after_finish_reason() {
+async fn repairs_missing_closing_brace_in_function_arguments() {
     if network_disabled() {
         println!(
             "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
@@ -385,35 +384,26 @@ async fn tool_call_arguments_may_continue_after_finish_reason() {
         return;
     }
 
-    let chunk1 = json!({
+    let chunk = serde_json::json!({
         "choices": [{
             "delta": {
                 "tool_calls": [{
                     "id": "call_1",
                     "type": "function",
                     "function": {
-                        "name": "run",
-                        "arguments": "{\"command\":[\"mkdir\",\"-p\""
-                    }
-                }]
-            },
-            "finish_reason": "tool_calls"
-        }]
-    });
-
-    let chunk2 = json!({
-        "choices": [{
-            "delta": {
-                "tool_calls": [{
-                    "function": {
-                        "arguments": ",\"diagrams\"]}"
+                        "name": "shell",
+                        "arguments": "{\"command\": [\"mkdir\", \"-p\", \"diagrams\"]",
                     }
                 }]
             }
         }]
-    });
+    })
+    .to_string();
 
-    let sse = format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n");
+    let sse = format!(
+        "data: {chunk}\n\n{}",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+    );
 
     let events = run_stream(&sse).await;
     assert_eq!(events.len(), 2, "unexpected events: {events:?}");
@@ -425,71 +415,12 @@ async fn tool_call_arguments_may_continue_after_finish_reason() {
             call_id,
             ..
         }) => {
-            assert_eq!(name, "run");
+            assert_eq!(name, "shell");
             assert_eq!(call_id, "call_1");
-            assert_eq!(arguments, "{\"command\":[\"mkdir\",\"-p\",\"diagrams\"]}");
-        }
-        other => panic!("expected function call, got {other:?}"),
-    }
-
-    assert!(matches!(events[1], ResponseEvent::Completed { .. }));
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn tool_call_arguments_may_arrive_on_message_chunk() {
-    if network_disabled() {
-        println!(
-            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
-        );
-        return;
-    }
-
-    let chunk1 = json!({
-        "choices": [{
-            "delta": {
-                "tool_calls": [{
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "run",
-                        "arguments": r#"{"foo":"bar"#
-                    }
-                }]
-            },
-            "finish_reason": "tool_calls"
-        }]
-    });
-
-    let chunk2 = json!({
-        "choices": [{
-            "message": {
-                "tool_calls": [{
-                    "id": "call_1",
-                    "type": "function",
-                    "function": {
-                        "name": "run",
-                        "arguments": r#"{"foo":"bar"}"#
-                    }
-                }]
-            }
-        }]
-    });
-
-    let sse = format!("data: {chunk1}\n\ndata: {chunk2}\n\ndata: [DONE]\n\n");
-
-    let events = run_stream(&sse).await;
-    assert_eq!(events.len(), 2, "unexpected events: {events:?}");
-
-    match &events[0] {
-        ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
-            name,
-            arguments,
-            call_id,
-            ..
-        }) => {
-            assert_eq!(name, "run");
-            assert_eq!(call_id, "call_1");
-            assert_eq!(arguments, r#"{"foo":"bar"}"#);
+            assert_eq!(
+                arguments,
+                "{\"command\": [\"mkdir\", \"-p\", \"diagrams\"]}"
+            );
         }
         other => panic!("expected function call, got {other:?}"),
     }

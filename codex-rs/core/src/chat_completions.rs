@@ -358,28 +358,6 @@ pub(crate) async fn stream_chat_completions(
     }
 }
 
-/// State to accumulate a function call across streaming chunks.
-/// OpenAI-compatible providers may split the `arguments` string over multiple
-/// `delta` events until the chunk whose `finish_reason` is `tool_calls` is
-/// emitted. We keep collecting the pieces here and forward a single
-/// `ResponseItem::FunctionCall` once the call is complete.
-#[derive(Default)]
-struct FunctionCallState {
-    name: Option<String>,
-    arguments: String,
-    call_id: Option<String>,
-    active: bool,
-}
-
-impl FunctionCallState {
-    fn reset(&mut self) {
-        self.name = None;
-        self.arguments.clear();
-        self.call_id = None;
-        self.active = false;
-    }
-}
-
 /// Lightweight SSE processor for the Chat Completions streaming format. The
 /// output is mapped onto Codex's internal [`ResponseEvent`] so that the rest
 /// of the pipeline can stay agnostic of the underlying wire format.
@@ -393,8 +371,53 @@ async fn process_chat_sse<S>(
 {
     let mut stream = stream.eventsource();
 
+    // State to accumulate a function call across streaming chunks.
+    // OpenAI may split the `arguments` string over multiple `delta` events
+    // until the chunk whose `finish_reason` is `tool_calls` is emitted. We
+    // keep collecting the pieces here and forward a single
+    // `ResponseItem::FunctionCall` once the call is complete.
+    #[derive(Default)]
+    struct FunctionCallState {
+        name: Option<String>,
+        arguments: String,
+        call_id: Option<String>,
+        active: bool,
+    }
+
+    fn fix_unclosed_json(raw: &str) -> String {
+        if serde_json::from_str::<serde_json::Value>(raw).is_ok() {
+            return raw.to_string();
+        }
+
+        let mut fixed = raw.to_string();
+        let mut stack: Vec<char> = Vec::new();
+
+        for ch in raw.chars() {
+            match ch {
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' => {
+                    if stack.pop() != Some(ch) {
+                        stack.clear();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        while let Some(ch) = stack.pop() {
+            fixed.push(ch);
+        }
+
+        if serde_json::from_str::<serde_json::Value>(&fixed).is_ok() {
+            fixed
+        } else {
+            raw.to_string()
+        }
+    }
+
     let mut fn_call_state = FunctionCallState::default();
-    let mut pending_finish_reason: Option<String> = None;
     let mut assistant_text = String::new();
     let mut reasoning_text = String::new();
 
@@ -411,15 +434,7 @@ async fn process_chat_sse<S>(
                 return;
             }
             Ok(None) => {
-                emit_finish_events(
-                    &tx_event,
-                    pending_finish_reason.as_deref(),
-                    &mut fn_call_state,
-                    &mut assistant_text,
-                    &mut reasoning_text,
-                )
-                .await;
-
+                // Stream closed gracefully – emit Completed with dummy id.
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {
                         response_id: String::new(),
@@ -441,14 +456,30 @@ async fn process_chat_sse<S>(
 
         // OpenAI Chat streaming sends a literal string "[DONE]" when finished.
         if sse.data.trim() == "[DONE]" {
-            emit_finish_events(
-                &tx_event,
-                pending_finish_reason.as_deref(),
-                &mut fn_call_state,
-                &mut assistant_text,
-                &mut reasoning_text,
-            )
-            .await;
+            // Emit any finalized items before closing so downstream consumers receive
+            // terminal events for both assistant content and raw reasoning.
+            if !assistant_text.is_empty() {
+                let item = ResponseItem::Message {
+                    role: "assistant".to_string(),
+                    content: vec![ContentItem::OutputText {
+                        text: std::mem::take(&mut assistant_text),
+                    }],
+                    id: None,
+                };
+                let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+            }
+
+            if !reasoning_text.is_empty() {
+                let item = ResponseItem::Reasoning {
+                    id: String::new(),
+                    summary: Vec::new(),
+                    content: Some(vec![ReasoningItemContent::ReasoningText {
+                        text: std::mem::take(&mut reasoning_text),
+                    }]),
+                    encrypted_content: None,
+                };
+                let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+            }
 
             let _ = tx_event
                 .send(Ok(ResponseEvent::Completed {
@@ -586,102 +617,78 @@ async fn process_chat_sse<S>(
                 }
             }
 
-            if let Some(tool_calls) = choice
-                .get("message")
-                .and_then(|m| m.get("tool_calls"))
-                .and_then(|tc| tc.as_array())
-                && let Some(tool_call) = tool_calls.first()
-            {
-                fn_call_state.active = true;
-
-                if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
-                    fn_call_state.call_id.get_or_insert_with(|| id.to_string());
-                }
-
-                if let Some(function) = tool_call.get("function") {
-                    if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
-                        fn_call_state.name.get_or_insert_with(|| name.to_string());
-                    }
-
-                    if let Some(arguments) = function.get("arguments").and_then(|a| a.as_str()) {
-                        fn_call_state.arguments = arguments.to_string();
-                    }
-                }
-            }
-
-            if let Some(function_call) = choice
-                .get("message")
-                .and_then(|m| m.get("function_call"))
-                .and_then(|fc| fc.as_object())
-            {
-                fn_call_state.active = true;
-
-                if let Some(name) = function_call.get("name").and_then(|n| n.as_str()) {
-                    fn_call_state.name.get_or_insert_with(|| name.to_string());
-                }
-
-                if let Some(arguments) = function_call.get("arguments").and_then(|a| a.as_str()) {
-                    fn_call_state.arguments = arguments.to_string();
-                }
-            }
-
             // Emit end-of-turn when finish_reason signals completion.
             if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                pending_finish_reason = Some(finish_reason.to_string());
+                match finish_reason {
+                    "tool_calls" | "function_call" if fn_call_state.active => {
+                        // First, flush the terminal raw reasoning so UIs can finalize
+                        // the reasoning stream before any exec/tool events begin.
+                        if !reasoning_text.is_empty() {
+                            let item = ResponseItem::Reasoning {
+                                id: String::new(),
+                                summary: Vec::new(),
+                                content: Some(vec![ReasoningItemContent::ReasoningText {
+                                    text: std::mem::take(&mut reasoning_text),
+                                }]),
+                                encrypted_content: None,
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+
+                        // Then emit the FunctionCall response item.
+                        let arguments = fix_unclosed_json(&fn_call_state.arguments);
+                        let item = ResponseItem::FunctionCall {
+                            id: None,
+                            name: fn_call_state.name.clone().unwrap_or_else(|| "".to_string()),
+                            arguments,
+                            call_id: fn_call_state.call_id.clone().unwrap_or_else(String::new),
+                        };
+
+                        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                    }
+                    "stop" => {
+                        // Regular turn without tool-call. Emit the final assistant message
+                        // as a single OutputItemDone so non-delta consumers see the result.
+                        if !assistant_text.is_empty() {
+                            let item = ResponseItem::Message {
+                                role: "assistant".to_string(),
+                                content: vec![ContentItem::OutputText {
+                                    text: std::mem::take(&mut assistant_text),
+                                }],
+                                id: None,
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+                        // Also emit a terminal Reasoning item so UIs can finalize raw reasoning.
+                        if !reasoning_text.is_empty() {
+                            let item = ResponseItem::Reasoning {
+                                id: String::new(),
+                                summary: Vec::new(),
+                                content: Some(vec![ReasoningItemContent::ReasoningText {
+                                    text: std::mem::take(&mut reasoning_text),
+                                }]),
+                                encrypted_content: None,
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+                    }
+                    _ => {}
+                }
+
+                // Emit Completed regardless of reason so the agent can advance.
+                let _ = tx_event
+                    .send(Ok(ResponseEvent::Completed {
+                        response_id: String::new(),
+                        token_usage: None,
+                    }))
+                    .await;
+
+                // Prepare for potential next turn (should not happen in same stream).
+                // fn_call_state = FunctionCallState::default();
+
+                return; // End processing for this SSE stream.
             }
         }
-    }
-}
-
-async fn emit_finish_events(
-    tx_event: &mpsc::Sender<Result<ResponseEvent>>,
-    finish_reason: Option<&str>,
-    fn_call_state: &mut FunctionCallState,
-    assistant_text: &mut String,
-    reasoning_text: &mut String,
-) {
-    if matches!(finish_reason, Some("tool_calls" | "function_call")) && fn_call_state.active {
-        if !reasoning_text.is_empty() {
-            let text = std::mem::take(reasoning_text);
-            let item = ResponseItem::Reasoning {
-                id: String::new(),
-                summary: Vec::new(),
-                content: Some(vec![ReasoningItemContent::ReasoningText { text }]),
-                encrypted_content: None,
-            };
-            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-        }
-
-        let item = ResponseItem::FunctionCall {
-            id: None,
-            name: fn_call_state.name.clone().unwrap_or_default(),
-            arguments: fn_call_state.arguments.clone(),
-            call_id: fn_call_state.call_id.clone().unwrap_or_default(),
-        };
-        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-        fn_call_state.reset();
-        return;
-    }
-
-    if !assistant_text.is_empty() {
-        let text = std::mem::take(assistant_text);
-        let item = ResponseItem::Message {
-            role: "assistant".to_string(),
-            content: vec![ContentItem::OutputText { text }],
-            id: None,
-        };
-        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-    }
-
-    if !reasoning_text.is_empty() {
-        let text = std::mem::take(reasoning_text);
-        let item = ResponseItem::Reasoning {
-            id: String::new(),
-            summary: Vec::new(),
-            content: Some(vec![ReasoningItemContent::ReasoningText { text }]),
-            encrypted_content: None,
-        };
-        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
     }
 }
 
