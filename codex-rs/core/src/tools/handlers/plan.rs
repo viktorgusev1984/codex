@@ -147,12 +147,13 @@ fn validate_plan_arguments(value: &Value) -> Result<(), FunctionCallError> {
         )
     })?;
 
-    if let Some(explanation) = obj.get("explanation")
-        && !explanation.is_string() {
+    if let Some(explanation) = obj.get("explanation") {
+        if !(explanation.is_string() || explanation.is_null()) {
             return Err(respond_with_hint(
-                "`explanation` must be a string when provided.",
+                "`explanation` must be a string or null when provided.",
             ));
         }
+    }
 
     let plan_value = obj
         .get("plan")
@@ -252,4 +253,31 @@ fn respond_with_hint(message: impl Into<String>) -> FunctionCallError {
     FunctionCallError::RespondToModel(format!(
         "failed to parse function arguments: {hint} {PLAN_ARGUMENT_EXAMPLE}"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::plan_tool::StepStatus;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn allows_null_explanation_and_maps_to_none() {
+        let args = parse_update_plan_arguments(
+            &json!({
+                "explanation": null,
+                "plan": [
+                    {"step": "Do something", "status": "pending"}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("arguments parsed");
+
+        assert_eq!(args.explanation, None);
+        assert_eq!(args.plan.len(), 1);
+        assert_eq!(args.plan[0].step, "Do something");
+        assert!(matches!(args.plan[0].status, StepStatus::Pending));
+    }
 }
