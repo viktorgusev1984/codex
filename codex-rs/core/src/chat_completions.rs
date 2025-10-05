@@ -371,6 +371,15 @@ struct FunctionCallState {
     active: bool,
 }
 
+impl FunctionCallState {
+    fn reset(&mut self) {
+        self.name = None;
+        self.arguments.clear();
+        self.call_id = None;
+        self.active = false;
+    }
+}
+
 /// Lightweight SSE processor for the Chat Completions streaming format. The
 /// output is mapped onto Codex's internal [`ResponseEvent`] so that the rest
 /// of the pipeline can stay agnostic of the underlying wire format.
@@ -405,7 +414,7 @@ async fn process_chat_sse<S>(
                 emit_finish_events(
                     &tx_event,
                     pending_finish_reason.as_deref(),
-                    &fn_call_state,
+                    &mut fn_call_state,
                     &mut assistant_text,
                     &mut reasoning_text,
                 )
@@ -435,7 +444,7 @@ async fn process_chat_sse<S>(
             emit_finish_events(
                 &tx_event,
                 pending_finish_reason.as_deref(),
-                &fn_call_state,
+                &mut fn_call_state,
                 &mut assistant_text,
                 &mut reasoning_text,
             )
@@ -627,7 +636,7 @@ async fn process_chat_sse<S>(
 async fn emit_finish_events(
     tx_event: &mpsc::Sender<Result<ResponseEvent>>,
     finish_reason: Option<&str>,
-    fn_call_state: &FunctionCallState,
+    fn_call_state: &mut FunctionCallState,
     assistant_text: &mut String,
     reasoning_text: &mut String,
 ) {
@@ -650,6 +659,7 @@ async fn emit_finish_events(
             call_id: fn_call_state.call_id.clone().unwrap_or_default(),
         };
         let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+        fn_call_state.reset();
         return;
     }
 
