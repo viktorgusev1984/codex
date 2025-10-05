@@ -584,6 +584,44 @@ async fn process_chat_sse<S>(
                 }
             }
 
+            // Some providers include the fully-populated tool call on the final
+            // `message` payload instead of the incremental `delta`. Capture that
+            // here so we have the complete arguments before emitting the
+            // `FunctionCall` item below.
+            if let Some(message) = choice.get("message") {
+                if let Some(tool_calls) = message.get("tool_calls").and_then(|tc| tc.as_array())
+                    && let Some(tool_call) = tool_calls.first()
+                {
+                    if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
+                        fn_call_state.call_id.get_or_insert_with(|| id.to_string());
+                    }
+
+                    if let Some(function) = tool_call.get("function") {
+                        if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
+                            fn_call_state.name.get_or_insert_with(|| name.to_string());
+                        }
+
+                        if let Some(arguments) = function.get("arguments").and_then(|a| a.as_str())
+                        {
+                            fn_call_state.arguments = arguments.to_string();
+                        }
+                    }
+                }
+
+                if let Some(function_call) =
+                    message.get("function_call").and_then(|fc| fc.as_object())
+                {
+                    if let Some(name) = function_call.get("name").and_then(|n| n.as_str()) {
+                        fn_call_state.name.get_or_insert_with(|| name.to_string());
+                    }
+
+                    if let Some(arguments) = function_call.get("arguments").and_then(|a| a.as_str())
+                    {
+                        fn_call_state.arguments = arguments.to_string();
+                    }
+                }
+            }
+
             // Emit end-of-turn when finish_reason signals completion.
             if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                 match finish_reason {
