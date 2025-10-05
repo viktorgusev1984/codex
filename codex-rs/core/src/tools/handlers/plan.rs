@@ -113,7 +113,19 @@ pub(crate) async fn handle_update_plan(
 }
 
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
-    serde_json::from_str::<UpdatePlanArgs>(arguments).map_err(|e| {
-        FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e}"))
+    serde_json::from_str::<UpdatePlanArgs>(arguments).map_err(|error| {
+        use serde_json::error::Category;
+
+        let example =
+            r#"Example: {"plan": [{"step": "Outline solution", "status": "in_progress"}]}"#;
+        let hint = match error.classify() {
+            Category::Data => "Ensure `plan` is an array of objects with `step` and `status` (pending, in_progress, completed).",
+            Category::Syntax | Category::Eof => "Provide the arguments as valid JSON with the `plan` array of steps.",
+            Category::Io => "Encountered an unexpected I/O error while reading the arguments.",
+        };
+
+        FunctionCallError::RespondToModel(format!(
+            "failed to parse function arguments: {error}. {hint} {example}"
+        ))
     })
 }

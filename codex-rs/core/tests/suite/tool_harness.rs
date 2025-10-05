@@ -315,6 +315,10 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
         output_text.contains("failed to parse function arguments"),
         "expected parse error message in output text, got {output_text:?}"
     );
+    assert!(
+        output_text.contains("Ensure `plan` is an array of objects"),
+        "expected guidance about the plan format in output text, got {output_text:?}"
+    );
     if let Some(success_flag) = output_item
         .get("output")
         .and_then(|value| value.as_object())
