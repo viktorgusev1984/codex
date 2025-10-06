@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -113,11 +114,19 @@ pub(crate) async fn handle_update_plan(
 }
 
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
-    let payload = serde_json::from_str::<serde_json::Value>(arguments).map_err(|e| {
+    let mut deserializer = serde_json::Deserializer::from_str(arguments);
+    let payload = serde_json::Value::deserialize(&mut deserializer).map_err(|e| {
         FunctionCallError::RespondToModel(format!(
             "failed to parse function arguments as JSON object: {e}"
         ))
     })?;
+
+    if let Err(err) = deserializer.end() {
+        return Err(FunctionCallError::RespondToModel(format!(
+            "invalid plan payload: expected one JSON object with a `plan` array of step objects and optional `explanation`, but found extra content near column {}. Wrap all plan fields inside a single object.",
+            err.column()
+        )));
+    }
 
     let payload_obj = payload.as_object().ok_or_else(|| {
         FunctionCallError::RespondToModel(
@@ -178,4 +187,24 @@ fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, Functi
 
     serde_json::from_value::<UpdatePlanArgs>(payload)
         .map_err(|e| FunctionCallError::RespondToModel(format!("invalid plan payload: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_update_plan_arguments_reports_trailing_content() {
+        let args = r#"{"plan": "step one"}, {"plan": "step two"}"#;
+        let error = parse_update_plan_arguments(args).expect_err("expected trailing content error");
+        match error {
+            FunctionCallError::RespondToModel(message) => {
+                assert!(
+                    message.contains("Wrap all plan fields inside a single object"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
 }
