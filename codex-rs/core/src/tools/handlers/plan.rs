@@ -113,7 +113,69 @@ pub(crate) async fn handle_update_plan(
 }
 
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
-    serde_json::from_str::<UpdatePlanArgs>(arguments).map_err(|e| {
-        FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e}"))
-    })
+    let payload = serde_json::from_str::<serde_json::Value>(arguments).map_err(|e| {
+        FunctionCallError::RespondToModel(format!(
+            "failed to parse function arguments as JSON object: {e}"
+        ))
+    })?;
+
+    let payload_obj = payload.as_object().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "invalid plan payload: expected a JSON object with a `plan` array".to_string(),
+        )
+    })?;
+
+    let plan_value = payload_obj.get("plan").ok_or_else(|| {
+        FunctionCallError::RespondToModel("invalid plan payload: missing `plan` array".to_string())
+    })?;
+
+    let plan_items = plan_value.as_array().ok_or_else(|| {
+        FunctionCallError::RespondToModel(
+            "invalid plan payload: `plan` must be an array of objects like {\"step\": \"...\", \"status\": \"pending\"}".
+                to_string(),
+        )
+    })?;
+
+    for (idx, item) in plan_items.iter().enumerate() {
+        let Some(item_obj) = item.as_object() else {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "invalid plan payload: item {idx} in `plan` is not an object"
+            )));
+        };
+
+        if !item_obj.contains_key("step") {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "invalid plan payload: item {idx} in `plan` is missing the `step` field"
+            )));
+        }
+
+        if !item_obj
+            .get("step")
+            .map(serde_json::Value::is_string)
+            .unwrap_or(false)
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "invalid plan payload: `step` in item {idx} must be a string"
+            )));
+        }
+
+        if !item_obj.contains_key("status") {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "invalid plan payload: item {idx} in `plan` is missing the `status` field"
+            )));
+        }
+
+        if !item_obj
+            .get("status")
+            .map(serde_json::Value::is_string)
+            .unwrap_or(false)
+        {
+            return Err(FunctionCallError::RespondToModel(format!(
+                "invalid plan payload: `status` in item {idx} must be a string"
+            )));
+        }
+    }
+
+    serde_json::from_value::<UpdatePlanArgs>(payload)
+        .map_err(|e| FunctionCallError::RespondToModel(format!("invalid plan payload: {e}")))
 }

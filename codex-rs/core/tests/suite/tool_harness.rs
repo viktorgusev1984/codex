@@ -312,7 +312,7 @@ async fn update_plan_tool_rejects_malformed_payload() -> anyhow::Result<()> {
     );
     let output_text = extract_output_text(output_item).expect("output text present");
     assert!(
-        output_text.contains("failed to parse function arguments"),
+        output_text.contains("invalid plan payload"),
         "expected parse error message in output text, got {output_text:?}"
     );
     if let Some(success_flag) = output_item
