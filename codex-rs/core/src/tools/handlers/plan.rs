@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -117,27 +118,52 @@ const PLAN_ARGUMENT_EXAMPLE: &str =
     r#"Example: {"plan": [{"step": "Outline solution", "status": "in_progress"}]}"#;
 
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
-    let value: Value = serde_json::from_str(arguments).map_err(map_invalid_json_error)?;
+    let mut deserializer = serde_json::Deserializer::from_str(arguments);
+    let value: Value = Value::deserialize(&mut deserializer)
+        .map_err(|error| map_invalid_json_error(arguments, error))?;
+
+    if let Err(error) = deserializer.end() {
+        return Err(map_invalid_json_error(arguments, error));
+    }
+
     validate_plan_arguments(&value)?;
-    serde_json::from_value(value).map_err(map_invalid_json_error)
+    serde_json::from_value(value).map_err(|error| map_invalid_json_error(arguments, error))
 }
 
-fn map_invalid_json_error(error: serde_json::Error) -> FunctionCallError {
+fn map_invalid_json_error(arguments: &str, error: serde_json::Error) -> FunctionCallError {
     use serde_json::error::Category;
 
     let hint = match error.classify() {
         Category::Data => {
             "Ensure `plan` is an array of objects with `step` and `status` (pending, in_progress, completed)."
+                .to_string()
         }
         Category::Syntax | Category::Eof => {
-            "Provide the arguments as a single JSON object with a `plan` array of steps."
+            let message = error.to_string();
+            if message.contains("trailing characters") {
+                trailing_characters_hint(arguments)
+            } else {
+                "Provide the arguments as a single JSON object with a `plan` array of steps.".to_string()
+            }
         }
-        Category::Io => "Encountered an unexpected I/O error while reading the arguments.",
+        Category::Io => "Encountered an unexpected I/O error while reading the arguments.".to_string(),
     };
 
     FunctionCallError::RespondToModel(format!(
         "failed to parse function arguments: {error}. {hint} {PLAN_ARGUMENT_EXAMPLE}"
     ))
+}
+
+fn trailing_characters_hint(arguments: &str) -> String {
+    if arguments.contains("},") {
+        return "Wrap each step object inside the `plan` array instead of sending multiple top-level JSON objects.".to_string();
+    }
+
+    if arguments.contains("\"plan\": \"") && !arguments.contains("\"plan\": [") {
+        return "Set `plan` to an array of step objects rather than a string, and include all steps inside that array.".to_string();
+    }
+
+    "Provide the arguments as a single JSON object with a `plan` array of steps.".to_string()
 }
 
 fn validate_plan_arguments(value: &Value) -> Result<(), FunctionCallError> {
@@ -148,11 +174,12 @@ fn validate_plan_arguments(value: &Value) -> Result<(), FunctionCallError> {
     })?;
 
     if let Some(explanation) = obj.get("explanation")
-        && !(explanation.is_string() || explanation.is_null()) {
-            return Err(respond_with_hint(
-                "`explanation` must be a string or null when provided.",
-            ));
-        }
+        && !(explanation.is_string() || explanation.is_null())
+    {
+        return Err(respond_with_hint(
+            "`explanation` must be a string or null when provided.",
+        ));
+    }
 
     let plan_value = obj
         .get("plan")
@@ -268,7 +295,7 @@ mod tests {
         match error {
             FunctionCallError::RespondToModel(message) => {
                 assert!(
-                    message.contains("Provide the arguments as a single JSON object"),
+                    message.contains("Wrap each step object inside the `plan` array"),
                     "unexpected error message: {message}"
                 );
             }
