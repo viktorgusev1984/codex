@@ -151,6 +151,10 @@ impl SessionManager {
             ExitStatus::Ongoing(session_id)
         };
 
+        if matches!(exit_status, ExitStatus::Exited(_)) {
+            self.sessions.lock().await.remove(&session_id);
+        }
+
         // If output exceeds cap, truncate the middle and record original token estimate.
         let (output, original_token_count) = truncate_middle(&output, cap_bytes);
         Ok(ExecCommandOutput {
@@ -217,9 +221,28 @@ impl SessionManager {
         let cap_bytes_u64 = max_output_tokens.saturating_mul(4);
         let cap_bytes: usize = cap_bytes_u64.min(usize::MAX as u64) as usize;
         let (output, original_token_count) = truncate_middle(&output, cap_bytes);
+        let mut exit_code: Option<i32> = None;
+        {
+            let mut sessions = self.sessions.lock().await;
+            let should_remove = match sessions.get(&session_id) {
+                Some(session) if session.has_exited() => {
+                    exit_code = session.exit_code();
+                    true
+                }
+                Some(_) => false,
+                None => false,
+            };
+            if should_remove {
+                sessions.remove(&session_id);
+            }
+        }
+
         Ok(ExecCommandOutput {
             wall_time: Instant::now().duration_since(start_time),
-            exit_status: ExitStatus::Ongoing(session_id),
+            exit_status: match exit_code {
+                Some(code) => ExitStatus::Exited(code),
+                None => ExitStatus::Ongoing(session_id),
+            },
             original_token_count,
             output,
         })
@@ -318,16 +341,20 @@ async fn create_exec_command_session(
     let (exit_tx, exit_rx) = oneshot::channel::<i32>();
     let exit_status = Arc::new(AtomicBool::new(false));
     let wait_exit_status = exit_status.clone();
+    let exit_code: Arc<StdMutex<Option<i32>>> = Arc::new(StdMutex::new(None));
+    let exit_code_store: Arc<StdMutex<Option<i32>>> = Arc::clone(&exit_code);
     let wait_handle = tokio::task::spawn_blocking(move || {
         let code = match child.wait() {
             Ok(status) => status.exit_code() as i32,
             Err(_) => -1,
         };
         wait_exit_status.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut guard) = exit_code_store.lock() {
+            *guard = Some(code);
+        }
         let _ = exit_tx.send(code);
     });
 
-    // Create and store the session with channels.
     let (session, initial_output_rx) = ExecCommandSession::new(
         writer_tx,
         output_tx,
@@ -336,6 +363,7 @@ async fn create_exec_command_session(
         writer_handle,
         wait_handle,
         exit_status,
+        Arc::clone(&exit_code),
     );
     Ok((session, initial_output_rx, exit_rx))
 }

@@ -2481,6 +2481,7 @@ mod tests {
     use crate::protocol::CompactedItem;
     use crate::protocol::InitialHistory;
     use crate::protocol::ResumedHistory;
+    use crate::protocol::SandboxPolicy;
     use crate::state::TaskKind;
     use crate::tasks::SessionTask;
     use crate::tasks::SessionTaskContext;
@@ -2490,6 +2491,7 @@ mod tests {
     use crate::tools::MODEL_FORMAT_TAIL_LINES;
     use crate::tools::ToolRouter;
     use crate::tools::handle_container_exec_with_params;
+    use crate::tools::spec::ConfigShellToolType;
     use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_app_server_protocol::AuthMode;
     use codex_protocol::models::ContentItem;
@@ -3029,6 +3031,172 @@ mod tests {
             found,
             "synthetic review interruption not recorded in history"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exec_stream_write_stdin_persists_file_contents() {
+        let (session, mut turn_context) = make_session_and_context();
+        turn_context.sandbox_policy = SandboxPolicy::DangerFullAccess;
+
+        let mut stream_tools_config = turn_context.tools_config.clone();
+        stream_tools_config.shell_type = ConfigShellToolType::Streamable;
+        turn_context.tools_config = stream_tools_config.clone();
+
+        let session = Arc::new(session);
+        let turn_context = Arc::new(turn_context);
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+
+        let router = ToolRouter::from_config(
+            &stream_tools_config,
+            Some(session.services.mcp_connection_manager.list_all_tools()),
+        );
+
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let target_path = temp_dir.path().join("agents.md");
+
+        let exec_args = json!({
+            "cmd": format!(
+                concat!(
+                    "python3 -c 'import sys, pathlib\n",
+                    "path = pathlib.Path(r\"{}\")\n",
+                    "with path.open(\"w\", encoding=\"utf-8\") as f:\n",
+                    "    for line in sys.stdin:\n",
+                    "        if line.rstrip() == \"__DONE__\":\n",
+                    "            break\n",
+                    "        f.write(line)\n",
+                    "'"
+                ),
+                target_path.display()
+            ),
+            "yield_time_ms": 500_u64,
+            "max_output_tokens": 4096_u64,
+            "shell": "/bin/bash",
+            "login": false
+        })
+        .to_string();
+
+        let exec_item = ResponseItem::FunctionCall {
+            id: None,
+            name: "exec_command".to_string(),
+            arguments: exec_args,
+            call_id: "call-exec".to_string(),
+        };
+        let exec_call = ToolRouter::build_tool_call(session.as_ref(), exec_item)
+            .expect("should build exec call")
+            .expect("expected exec call");
+
+        let exec_response = router
+            .dispatch_tool_call(
+                Arc::clone(&session),
+                Arc::clone(&turn_context),
+                Arc::clone(&tracker),
+                "sub-stream".to_string(),
+                exec_call,
+            )
+            .await
+            .expect("exec command call should succeed");
+
+        let ResponseInputItem::FunctionCallOutput { output, .. } = exec_response else {
+            panic!("expected function call output for exec_command");
+        };
+        let session_marker = "Process running with session ID ";
+        let session_pos = output
+            .content
+            .find(session_marker)
+            .expect("session id in exec output")
+            + session_marker.len();
+        let session_id_str = output.content[session_pos..]
+            .split_whitespace()
+            .next()
+            .expect("session id token");
+        let session_id: u32 = session_id_str.parse().expect("numeric session id");
+
+        let body_args = json!({
+            "session_id": session_id,
+            "chars": "first line\nsecond line\n",
+            "yield_time_ms": 500_u64,
+            "max_output_tokens": 4096_u64
+        })
+        .to_string();
+        let body_item = ResponseItem::FunctionCall {
+            id: None,
+            name: "write_stdin".to_string(),
+            arguments: body_args,
+            call_id: "call-write".to_string(),
+        };
+        let body_call = ToolRouter::build_tool_call(session.as_ref(), body_item)
+            .expect("should build write call")
+            .expect("expected write call");
+
+        let body_response = router
+            .dispatch_tool_call(
+                Arc::clone(&session),
+                Arc::clone(&turn_context),
+                Arc::clone(&tracker),
+                "sub-stream".to_string(),
+                body_call,
+            )
+            .await
+            .expect("write_stdin body should succeed");
+
+        let ResponseInputItem::FunctionCallOutput {
+            output: body_output,
+            ..
+        } = body_response
+        else {
+            panic!("expected function call output for write_stdin body");
+        };
+        assert!(
+            body_output
+                .content
+                .contains("Process running with session ID"),
+            "write_stdin should keep session running"
+        );
+
+        let close_args = json!({
+            "session_id": session_id,
+            "chars": "__DONE__\n",
+            "yield_time_ms": 500_u64,
+            "max_output_tokens": 4096_u64
+        })
+        .to_string();
+        let close_item = ResponseItem::FunctionCall {
+            id: None,
+            name: "write_stdin".to_string(),
+            arguments: close_args,
+            call_id: "call-close".to_string(),
+        };
+        let close_call = ToolRouter::build_tool_call(session.as_ref(), close_item)
+            .expect("should build close call")
+            .expect("expected close call");
+
+        let close_response = router
+            .dispatch_tool_call(
+                Arc::clone(&session),
+                Arc::clone(&turn_context),
+                Arc::clone(&tracker),
+                "sub-stream".to_string(),
+                close_call,
+            )
+            .await
+            .expect("write_stdin close should succeed");
+
+        let ResponseInputItem::FunctionCallOutput {
+            output: close_output,
+            ..
+        } = close_response
+        else {
+            panic!("expected function call output for write_stdin close");
+        };
+        assert!(
+            close_output.content.contains("Process exited with code 0"),
+            "write_stdin close should exit cleanly"
+        );
+
+        let written = std::fs::read_to_string(&target_path)
+            .expect("streamed file contents should be readable");
+        pretty_assertions::assert_eq!(written, "first line\nsecond line\n");
     }
 
     #[tokio::test]

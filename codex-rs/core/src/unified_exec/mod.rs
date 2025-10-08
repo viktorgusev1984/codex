@@ -384,9 +384,17 @@ async fn create_unified_exec_session(
 
     let exit_status = Arc::new(AtomicBool::new(false));
     let wait_exit_status = Arc::clone(&exit_status);
+    let exit_code: Arc<StdMutex<Option<i32>>> = Arc::new(StdMutex::new(None));
+    let exit_code_store = Arc::clone(&exit_code);
     let wait_handle = tokio::task::spawn_blocking(move || {
-        let _ = child.wait();
+        let code = match child.wait() {
+            Ok(status) => status.exit_code() as i32,
+            Err(_) => -1,
+        };
         wait_exit_status.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = exit_code_store.lock() {
+            *guard = Some(code);
+        }
     });
 
     let (session, initial_output_rx) = ExecCommandSession::new(
@@ -397,6 +405,7 @@ async fn create_unified_exec_session(
         writer_handle,
         wait_handle,
         exit_status,
+        Arc::clone(&exit_code),
     );
     Ok((session, initial_output_rx))
 }
