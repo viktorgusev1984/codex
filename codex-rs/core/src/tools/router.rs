@@ -6,7 +6,6 @@ use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
 use crate::tool_arguments::parse_tool_arguments;
-use crate::tool_arguments::repair_tool_arguments;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
@@ -18,7 +17,6 @@ use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::models::ShellToolCallParams;
-use tracing::warn;
 
 #[derive(Clone)]
 pub struct ToolCall {
@@ -80,15 +78,6 @@ impl ToolRouter {
                         },
                     }))
                 } else {
-                    let mut arguments = arguments;
-                    if let Some(fixed) = repair_tool_arguments(&arguments) {
-                        warn!(
-                            tool_name = %name,
-                            "synthesized missing closing delimiters for tool arguments"
-                        );
-                        arguments = fixed;
-                    }
-
                     validate_tool_arguments(name.as_ref(), &arguments)?;
                     let payload = if name == "unified_exec" {
                         ToolPayload::UnifiedExec { arguments }
