@@ -197,7 +197,7 @@ fn validate_tool_arguments(name: &str, arguments: &str) -> Result<(), FunctionCa
         .map(|_| ())
         .map_err(|error| {
             FunctionCallError::RespondToModel(format!(
-                "failed to parse arguments for tool {name}: {error}"
+                "The {name} tool arguments must be valid JSON that matches the documented schema. Return a single JSON value with no commentary. Parser error: {error}"
             ))
         })
 }
