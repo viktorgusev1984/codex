@@ -5,6 +5,7 @@ use crate::client_common::tools::ToolSpec;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
+use crate::tool_arguments::parse_tool_arguments;
 use crate::tool_arguments::repair_tool_arguments;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
@@ -68,6 +69,7 @@ impl ToolRouter {
                 ..
             } => {
                 if let Some((server, tool)) = session.parse_mcp_tool_name(&name) {
+                    validate_tool_arguments(name.as_ref(), &arguments)?;
                     Ok(Some(ToolCall {
                         tool_name: name,
                         call_id,
@@ -87,6 +89,7 @@ impl ToolRouter {
                         arguments = fixed;
                     }
 
+                    validate_tool_arguments(name.as_ref(), &arguments)?;
                     let payload = if name == "unified_exec" {
                         ToolPayload::UnifiedExec { arguments }
                     } else {
@@ -196,6 +199,48 @@ impl ToolRouter {
                     success: Some(false),
                 },
             }
+        }
+    }
+}
+
+fn validate_tool_arguments(name: &str, arguments: &str) -> Result<(), FunctionCallError> {
+    parse_tool_arguments(arguments)
+        .map(|_| ())
+        .map_err(|error| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to parse arguments for tool {name}: {error}"
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_tool_arguments;
+    use crate::function_tool::FunctionCallError;
+
+    #[test]
+    fn validate_tool_arguments_accepts_valid_json() {
+        let arguments = "{\"command\": [\"echo\", \"hi\"]}";
+        let result = validate_tool_arguments("shell", arguments);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_tool_arguments_accepts_empty_arguments() {
+        let result = validate_tool_arguments("shell", "");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_tool_arguments_rejects_invalid_json() {
+        let arguments = "{\"command\": [\"echo\" \"hi\"]}";
+        let result = validate_tool_arguments("shell", arguments);
+        let err = result.expect_err("expected invalid json to fail");
+        match err {
+            FunctionCallError::RespondToModel(message) => {
+                assert!(message.contains("shell"), "unexpected message: {message}");
+            }
+            other => panic!("expected RespondToModel error, got {other:?}"),
         }
     }
 }
