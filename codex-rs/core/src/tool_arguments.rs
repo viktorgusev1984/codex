@@ -50,6 +50,7 @@ fn fix_unclosed_json_delimiters(arguments: &str) -> Option<String> {
     let mut stack: Vec<char> = Vec::new();
     let mut in_string = false;
     let mut escaped = false;
+    let mut needs_fix = false;
 
     for ch in trimmed.chars() {
         if in_string {
@@ -83,12 +84,21 @@ fn fix_unclosed_json_delimiters(arguments: &str) -> Option<String> {
         }
     }
 
-    if stack.is_empty() {
-        return None;
+    if in_string {
+        result.push('"');
+        needs_fix = true;
+    }
+
+    if !stack.is_empty() {
+        needs_fix = true;
     }
 
     while let Some(ch) = stack.pop() {
         result.push(ch);
+    }
+
+    if !needs_fix {
+        return None;
     }
 
     result.push_str(trailing_whitespace);
@@ -124,6 +134,13 @@ mod tests {
     }
 
     #[test]
+    fn fix_unclosed_json_delimiters_adds_missing_quote() {
+        let args = "{\"text\": \"hello";
+        let fixed = fix_unclosed_json_delimiters(args).expect("should fix");
+        assert_eq!(fixed, "{\"text\": \"hello\"}");
+    }
+
+    #[test]
     fn fix_unclosed_json_delimiters_ignores_braces_in_strings() {
         let args = "{\"text\": \"use {curly}\"";
         let fixed = fix_unclosed_json_delimiters(args).expect("should fix");
@@ -148,6 +165,13 @@ mod tests {
         let args = "{\"foo\": 1";
         let repaired = repair_tool_arguments(args).expect("should repair");
         assert_eq!(repaired, "{\"foo\": 1}");
+    }
+
+    #[test]
+    fn repair_tool_arguments_closes_unterminated_string() {
+        let args = "{\"text\": \"hello";
+        let repaired = repair_tool_arguments(args).expect("should repair");
+        assert_eq!(repaired, "{\"text\": \"hello\"}");
     }
 
     #[test]
