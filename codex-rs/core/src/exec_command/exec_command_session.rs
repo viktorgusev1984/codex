@@ -79,32 +79,36 @@ impl ExecCommandSession {
             Err(_) => None,
         }
     }
+
+    fn abort_or_detach_handle(handle: &StdMutex<Option<JoinHandle<()>>>, has_exited: bool) {
+        let join_handle_opt = handle.lock().ok().and_then(|mut guard| guard.take());
+
+        if let Some(join_handle) = join_handle_opt
+            && !has_exited
+        {
+            join_handle.abort();
+        }
+        // When the process has already exited we intentionally drop the
+        // handle without aborting so any in-flight writer flushes can
+        // complete before the task finishes. Dropping the handle detaches
+        // the task, allowing it to conclude naturally.
+    }
 }
 
 impl Drop for ExecCommandSession {
     fn drop(&mut self) {
-        // Best-effort: terminate child first so blocking tasks can complete.
-        if let Ok(mut killer_opt) = self.killer.lock()
-            && let Some(mut killer) = killer_opt.take()
+        let has_exited = self.has_exited();
+
+        let killer_opt = self.killer.lock().ok().and_then(|mut stored| stored.take());
+
+        if let Some(mut killer) = killer_opt
+            && !has_exited
         {
             let _ = killer.kill();
         }
 
-        // Abort background tasks; they may already have exited after kill.
-        if let Ok(mut h) = self.reader_handle.lock()
-            && let Some(handle) = h.take()
-        {
-            handle.abort();
-        }
-        if let Ok(mut h) = self.writer_handle.lock()
-            && let Some(handle) = h.take()
-        {
-            handle.abort();
-        }
-        if let Ok(mut h) = self.wait_handle.lock()
-            && let Some(handle) = h.take()
-        {
-            handle.abort();
-        }
+        Self::abort_or_detach_handle(&self.reader_handle, has_exited);
+        Self::abort_or_detach_handle(&self.writer_handle, has_exited);
+        Self::abort_or_detach_handle(&self.wait_handle, has_exited);
     }
 }
