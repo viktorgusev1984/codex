@@ -2275,21 +2275,28 @@ async fn try_run_turn(
 }
 
 fn response_for_model_error(item: &ResponseItem, message: String) -> ResponseInputItem {
-    let call_id = match item {
+    match item {
+        ResponseItem::CustomToolCall { call_id, .. } => ResponseInputItem::CustomToolCallOutput {
+            call_id: call_id.clone(),
+            output: message,
+        },
         ResponseItem::FunctionCall { call_id, .. }
-        | ResponseItem::CustomToolCall { call_id, .. } => call_id.clone(),
-        ResponseItem::LocalShellCall {
+        | ResponseItem::LocalShellCall {
             call_id: Some(call_id),
             ..
-        } => call_id.clone(),
-        _ => String::new(),
-    };
-
-    ResponseInputItem::FunctionCallOutput {
-        call_id,
-        output: FunctionCallOutputPayload {
-            content: message,
-            success: None,
+        } => ResponseInputItem::FunctionCallOutput {
+            call_id: call_id.clone(),
+            output: FunctionCallOutputPayload {
+                content: message,
+                success: Some(false),
+            },
+        },
+        _ => ResponseInputItem::FunctionCallOutput {
+            call_id: String::new(),
+            output: FunctionCallOutputPayload {
+                content: message,
+                success: Some(false),
+            },
         },
     }
 }
@@ -2505,7 +2512,28 @@ mod tests {
             ResponseInputItem::FunctionCallOutput { call_id, output } => {
                 assert_eq!(call_id, "call-42");
                 assert_eq!(output.content, "parse failed");
-                assert_eq!(output.success, None);
+                assert_eq!(output.success, Some(false));
+            }
+            other => panic!("unexpected response variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_for_model_error_uses_custom_variant() {
+        let item = ResponseItem::CustomToolCall {
+            id: None,
+            status: None,
+            name: "custom_tool".to_string(),
+            input: "{}".to_string(),
+            call_id: "call-99".to_string(),
+        };
+
+        let response = response_for_model_error(&item, "parse failed".to_string());
+
+        match response {
+            ResponseInputItem::CustomToolCallOutput { call_id, output } => {
+                assert_eq!(call_id, "call-99");
+                assert_eq!(output, "parse failed");
             }
             other => panic!("unexpected response variant: {other:?}"),
         }
