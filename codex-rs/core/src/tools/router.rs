@@ -13,7 +13,6 @@ use crate::tools::registry::ConfiguredToolSpec;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec::ToolsConfig;
 use crate::tools::spec::build_specs;
-use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::LocalShellAction;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
@@ -25,7 +24,6 @@ pub struct ToolCall {
     pub tool_name: String,
     pub call_id: String,
     pub payload: ToolPayload,
-    pub arguments_repaired: bool,
 }
 
 pub struct ToolRouter {
@@ -78,18 +76,15 @@ impl ToolRouter {
                             tool,
                             raw_arguments: arguments,
                         },
-                        arguments_repaired: false,
                     }))
                 } else {
                     let mut arguments = arguments;
-                    let mut arguments_repaired = false;
                     if let Some(fixed) = repair_tool_arguments(&arguments) {
                         warn!(
                             tool_name = %name,
                             "synthesized missing closing delimiters for tool arguments"
                         );
                         arguments = fixed;
-                        arguments_repaired = true;
                     }
 
                     let payload = if name == "unified_exec" {
@@ -101,7 +96,6 @@ impl ToolRouter {
                         tool_name: name,
                         call_id,
                         payload,
-                        arguments_repaired,
                     }))
                 }
             }
@@ -114,7 +108,6 @@ impl ToolRouter {
                 tool_name: name,
                 call_id,
                 payload: ToolPayload::Custom { input },
-                arguments_repaired: false,
             })),
             ResponseItem::LocalShellCall {
                 id,
@@ -139,7 +132,6 @@ impl ToolRouter {
                             tool_name: "local_shell".to_string(),
                             call_id,
                             payload: ToolPayload::LocalShell { params },
-                            arguments_repaired: false,
                         }))
                     }
                 }
@@ -160,22 +152,7 @@ impl ToolRouter {
             tool_name,
             call_id,
             payload,
-            arguments_repaired,
         } = call;
-        if arguments_repaired {
-            warn!(
-                tool_name = %tool_name,
-                call_id = %call_id,
-                "rejecting repaired tool arguments"
-            );
-            return Ok(ResponseInputItem::FunctionCallOutput {
-                call_id,
-                output: FunctionCallOutputPayload {
-                    content: "Tool arguments appeared truncated. Please regenerate the full JSON payload and try again.".to_string(),
-                    success: Some(false),
-                },
-            });
-        }
         let payload_outputs_custom = matches!(payload, ToolPayload::Custom { .. });
         let failure_call_id = call_id.clone();
 
@@ -226,68 +203,34 @@ impl ToolRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codex::Session;
-    use crate::codex::TurnContext;
     use crate::codex::make_session_and_context;
-    use crate::turn_diff_tracker::TurnDiffTracker;
     use codex_protocol::models::ResponseItem;
-    use pretty_assertions::assert_eq;
-    use std::sync::Arc;
 
-    #[tokio::test]
-    async fn repaired_arguments_are_rejected_with_failure_response() {
-        let (session, turn_context) = make_session_and_context();
-        let session: Arc<Session> = Arc::new(session);
-        let turn: Arc<TurnContext> = Arc::new(turn_context);
-        let router = ToolRouter::from_config(&turn.tools_config, None);
+    #[test]
+    fn build_tool_call_repairs_truncated_arguments() {
+        let (session, _turn_context) = make_session_and_context();
 
+        let raw_arguments =
+            "{\"command\": [\"bash\", \"-lc\", \"cat <<'EOF' > AGENTS.md\\nhello\\nEOF\"]";
         let item = ResponseItem::FunctionCall {
             id: None,
             name: "shell".to_string(),
-            arguments: "{\"command\": [\"bash\", \"-lc\", \"cat <<'EOF' > AGENTS.md\"".to_string(),
+            arguments: raw_arguments.to_string(),
             call_id: "call-42".to_string(),
         };
 
-        let call = ToolRouter::build_tool_call(session.as_ref(), item)
+        let call = ToolRouter::build_tool_call(&session, item)
             .expect("should build call")
             .expect("expected call");
-        assert!(call.arguments_repaired);
 
-        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
-        let response = router
-            .dispatch_tool_call(
-                Arc::clone(&session),
-                Arc::clone(&turn),
-                Arc::clone(&tracker),
-                "sub".to_string(),
-                call.clone(),
-            )
-            .await
-            .expect("should respond to model");
-
-        match response {
-            ResponseInputItem::FunctionCallOutput { call_id, output } => {
-                assert_eq!(call_id, "call-42");
-                assert_eq!(output.success, Some(false));
-                assert!(output.content.contains("Tool arguments appeared truncated"));
+        match call.payload {
+            ToolPayload::Function { arguments } => {
+                let expected = [raw_arguments, "}"].concat();
+                assert_eq!(arguments, expected);
+                serde_json::from_str::<serde_json::Value>(&arguments)
+                    .expect("repaired arguments should be valid JSON");
             }
-            other => panic!("expected FunctionCallOutput, got {other:?}"),
-        }
-
-        // Dispatching again should continue returning the same failure response
-        // without attempting to execute the underlying tool.
-        let response = router
-            .dispatch_tool_call(session, turn, tracker, "sub".to_string(), call)
-            .await
-            .expect("should respond to model");
-
-        match response {
-            ResponseInputItem::FunctionCallOutput { call_id, output } => {
-                assert_eq!(call_id, "call-42");
-                assert_eq!(output.success, Some(false));
-                assert!(output.content.contains("Tool arguments appeared truncated"));
-            }
-            other => panic!("expected FunctionCallOutput, got {other:?}"),
+            _ => panic!("expected function payload"),
         }
     }
 }
