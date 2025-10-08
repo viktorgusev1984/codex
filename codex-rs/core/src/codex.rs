@@ -2171,26 +2171,14 @@ async fn try_run_turn(
                             .log_tool_failed("local_shell", msg);
                         error!(msg);
 
-                        let response = ResponseInputItem::FunctionCallOutput {
-                            call_id: String::new(),
-                            output: FunctionCallOutputPayload {
-                                content: msg.to_string(),
-                                success: None,
-                            },
-                        };
+                        let response = response_for_model_error(&item, msg.to_string());
                         add_completed(ProcessedResponseItem {
                             item,
                             response: Some(response),
                         });
                     }
                     Err(FunctionCallError::RespondToModel(message)) => {
-                        let response = ResponseInputItem::FunctionCallOutput {
-                            call_id: String::new(),
-                            output: FunctionCallOutputPayload {
-                                content: message,
-                                success: None,
-                            },
-                        };
+                        let response = response_for_model_error(&item, message);
                         add_completed(ProcessedResponseItem {
                             item,
                             response: Some(response),
@@ -2283,6 +2271,26 @@ async fn try_run_turn(
                 }
             }
         }
+    }
+}
+
+fn response_for_model_error(item: &ResponseItem, message: String) -> ResponseInputItem {
+    let call_id = match item {
+        ResponseItem::FunctionCall { call_id, .. }
+        | ResponseItem::CustomToolCall { call_id, .. } => call_id.clone(),
+        ResponseItem::LocalShellCall {
+            call_id: Some(call_id),
+            ..
+        } => call_id.clone(),
+        _ => String::new(),
+    };
+
+    ResponseInputItem::FunctionCallOutput {
+        call_id,
+        output: FunctionCallOutputPayload {
+            content: message,
+            success: None,
+        },
     }
 }
 
@@ -2480,6 +2488,27 @@ mod tests {
         let reconstructed = session.reconstruct_history_from_rollout(&turn_context, &rollout_items);
 
         assert_eq!(expected, reconstructed);
+    }
+
+    #[test]
+    fn response_for_model_error_returns_call_id() {
+        let item = ResponseItem::FunctionCall {
+            id: None,
+            name: "update_plan".to_string(),
+            arguments: "{}".to_string(),
+            call_id: "call-42".to_string(),
+        };
+
+        let response = response_for_model_error(&item, "parse failed".to_string());
+
+        match response {
+            ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "call-42");
+                assert_eq!(output.content, "parse failed");
+                assert_eq!(output.success, None);
+            }
+            other => panic!("unexpected response variant: {other:?}"),
+        }
     }
 
     #[test]
