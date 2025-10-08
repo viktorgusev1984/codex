@@ -376,6 +376,59 @@ async fn streams_legacy_function_call_delta() {
     assert!(matches!(events[1], ResponseEvent::Completed { .. }));
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repairs_missing_closing_brace_in_function_arguments() {
+    if network_disabled() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": "{\"command\": [\"mkdir\", \"-p\", \"diagrams\"]",
+                    }
+                }]
+            }
+        }]
+    })
+    .to_string();
+
+    let sse = format!(
+        "data: {chunk}\n\n{}",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n"
+    );
+
+    let events = run_stream(&sse).await;
+    assert_eq!(events.len(), 2, "unexpected events: {events:?}");
+
+    match &events[0] {
+        ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+            name,
+            arguments,
+            call_id,
+            ..
+        }) => {
+            assert_eq!(name, "shell");
+            assert_eq!(call_id, "call_1");
+            assert_eq!(
+                arguments,
+                "{\"command\": [\"mkdir\", \"-p\", \"diagrams\"]}"
+            );
+        }
+        other => panic!("expected function call, got {other:?}"),
+    }
+
+    assert!(matches!(events[1], ResponseEvent::Completed { .. }));
+}
+
 #[tokio::test]
 #[traced_test]
 async fn chat_sse_emits_failed_on_parse_error() {

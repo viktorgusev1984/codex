@@ -384,6 +384,39 @@ async fn process_chat_sse<S>(
         active: bool,
     }
 
+    fn fix_unclosed_json(raw: &str) -> String {
+        if serde_json::from_str::<serde_json::Value>(raw).is_ok() {
+            return raw.to_string();
+        }
+
+        let mut fixed = raw.to_string();
+        let mut stack: Vec<char> = Vec::new();
+
+        for ch in raw.chars() {
+            match ch {
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' => {
+                    if stack.pop() != Some(ch) {
+                        stack.clear();
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        while let Some(ch) = stack.pop() {
+            fixed.push(ch);
+        }
+
+        if serde_json::from_str::<serde_json::Value>(&fixed).is_ok() {
+            fixed
+        } else {
+            raw.to_string()
+        }
+    }
+
     let mut fn_call_state = FunctionCallState::default();
     let mut assistant_text = String::new();
     let mut reasoning_text = String::new();
@@ -603,10 +636,11 @@ async fn process_chat_sse<S>(
                         }
 
                         // Then emit the FunctionCall response item.
+                        let arguments = fix_unclosed_json(&fn_call_state.arguments);
                         let item = ResponseItem::FunctionCall {
                             id: None,
                             name: fn_call_state.name.clone().unwrap_or_else(|| "".to_string()),
-                            arguments: fn_call_state.arguments.clone(),
+                            arguments,
                             call_id: fn_call_state.call_id.clone().unwrap_or_else(String::new),
                         };
 
