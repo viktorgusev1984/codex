@@ -22,6 +22,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_util::io::ReaderStream;
 use tracing::debug;
+use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
@@ -387,8 +388,18 @@ impl ModelClient {
                 }
 
                 if status == StatusCode::TOO_MANY_REQUESTS {
-                    let rate_limit_snapshot = parse_rate_limit_snapshot(res.headers());
-                    let body = res.json::<ErrorResponse>().await.ok();
+                    let headers = res.headers().clone();
+                    let body_text = res.text().await.unwrap_or_default();
+
+                    info!(
+                        status = %status,
+                        headers = ?headers,
+                        body = %body_text,
+                        "Responses API returned 429 Too Many Requests"
+                    );
+
+                    let rate_limit_snapshot = parse_rate_limit_snapshot(&headers);
+                    let body = serde_json::from_str::<ErrorResponse>(&body_text).ok();
                     if let Some(ErrorResponse { error }) = body {
                         if error.r#type.as_deref() == Some("usage_limit_reached") {
                             // Prefer the plan_type provided in the error message if present
@@ -408,12 +419,22 @@ impl ModelClient {
                             return Err(StreamAttemptError::Fatal(CodexErr::UsageNotIncluded));
                         }
                     }
+
+                    return Err(StreamAttemptError::RetryableHttpError {
+                        status,
+                        retry_after,
+                        request_id,
+                        body: Some(body_text),
+                        headers: Some(headers),
+                    });
                 }
 
                 Err(StreamAttemptError::RetryableHttpError {
                     status,
                     retry_after,
                     request_id,
+                    body: None,
+                    headers: None,
                 })
             }
             Err(e) => Err(StreamAttemptError::RetryableTransportError(e.into())),
@@ -458,6 +479,8 @@ enum StreamAttemptError {
         status: StatusCode,
         retry_after: Option<Duration>,
         request_id: Option<String>,
+        body: Option<String>,
+        headers: Option<HeaderMap>,
     },
     RetryableTransportError(CodexErr),
     Fatal(CodexErr),
@@ -483,12 +506,21 @@ impl StreamAttemptError {
     fn into_error(self) -> CodexErr {
         match self {
             Self::RetryableHttpError {
-                status, request_id, ..
+                status,
+                request_id,
+                body,
+                headers,
+                ..
             } => {
                 if status == StatusCode::INTERNAL_SERVER_ERROR {
                     CodexErr::InternalServerError
                 } else {
-                    CodexErr::RetryLimit(RetryLimitReachedError { status, request_id })
+                    CodexErr::RetryLimit(RetryLimitReachedError {
+                        status,
+                        request_id,
+                        body,
+                        headers,
+                    })
                 }
             }
             Self::RetryableTransportError(error) => error,
