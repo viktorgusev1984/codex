@@ -371,12 +371,8 @@ async fn process_chat_sse<S>(
 {
     let mut stream = stream.eventsource();
 
-    // State to accumulate a function call across streaming chunks.
-    // OpenAI may split the `arguments` string over multiple `delta` events
-    // until the chunk whose `finish_reason` is `tool_calls` is emitted. We
-    // keep collecting the pieces here and forward a single
-    // `ResponseItem::FunctionCall` once the call is complete.
-    #[derive(Default)]
+    // Состояние для нового формата (несколько tool_calls по индексу)
+    #[derive(Default, Debug, Clone)]
     struct FunctionCallState {
         name: Option<String>,
         arguments: String,
@@ -384,7 +380,15 @@ async fn process_chat_sse<S>(
         active: bool,
     }
 
-    let mut fn_call_state = FunctionCallState::default();
+    let mut tool_calls: Vec<FunctionCallState> = Vec::new();
+    let mut legacy_fn: FunctionCallState = FunctionCallState::default();
+
+    fn ensure_tc_len(v: &mut Vec<FunctionCallState>, idx: usize) {
+        if v.len() <= idx {
+            v.resize_with(idx + 1, FunctionCallState::default);
+        }
+    }
+
     let mut assistant_text = String::new();
     let mut reasoning_text = String::new();
 
@@ -481,8 +485,6 @@ async fn process_chat_sse<S>(
             }
 
             // Forward any reasoning/thinking deltas if present.
-            // Some providers stream `reasoning` as a plain string while others
-            // nest the text under an object (e.g. `{ "reasoning": { "text": "…" } }`).
             if let Some(reasoning_val) = choice.get("delta").and_then(|d| d.get("reasoning")) {
                 let mut maybe_text = reasoning_val
                     .as_str()
@@ -506,7 +508,6 @@ async fn process_chat_sse<S>(
                 }
 
                 if let Some(reasoning) = maybe_text {
-                    // Accumulate so we can emit a terminal Reasoning item at the end.
                     reasoning_text.push_str(&reasoning);
                     let _ = tx_event
                         .send(Ok(ResponseEvent::ReasoningContentDelta(reasoning)))
@@ -517,7 +518,6 @@ async fn process_chat_sse<S>(
             // Some providers only include reasoning on the final message object.
             if let Some(message_reasoning) = choice.get("message").and_then(|m| m.get("reasoning"))
             {
-                // Accept either a plain string or an object with { text | content }
                 if let Some(s) = message_reasoning.as_str() {
                     if !s.is_empty() {
                         reasoning_text.push_str(s);
@@ -527,9 +527,9 @@ async fn process_chat_sse<S>(
                     }
                 } else if let Some(obj) = message_reasoning.as_object()
                     && let Some(s) = obj
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| obj.get("content").and_then(|v| v.as_str()))
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| obj.get("content").and_then(|v| v.as_str()))
                     && !s.is_empty()
                 {
                     reasoning_text.push_str(s);
@@ -539,57 +539,82 @@ async fn process_chat_sse<S>(
                 }
             }
 
-            // Handle streaming function / tool calls.
-            if let Some(tool_calls) = choice
+            // --- Новый формат: delta.tool_calls[*] c index ---
+            if let Some(tool_calls_delta) = choice
                 .get("delta")
                 .and_then(|d| d.get("tool_calls"))
                 .and_then(|tc| tc.as_array())
-                && let Some(tool_call) = tool_calls.first()
             {
-                // Mark that we have an active function call in progress.
-                fn_call_state.active = true;
+                for tc in tool_calls_delta {
+                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    ensure_tc_len(&mut tool_calls, idx);
+                    let st = &mut tool_calls[idx];
+                    st.active = true;
 
-                // Extract call_id if present.
-                if let Some(id) = tool_call.get("id").and_then(|v| v.as_str()) {
-                    fn_call_state.call_id.get_or_insert_with(|| id.to_string());
-                }
-
-                // Extract function details if present.
-                if let Some(function) = tool_call.get("function") {
-                    if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
-                        fn_call_state.name.get_or_insert_with(|| name.to_string());
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        st.call_id.get_or_insert_with(|| id.to_string());
                     }
 
-                    if let Some(args_fragment) = function.get("arguments").and_then(|a| a.as_str())
-                    {
-                        fn_call_state.arguments.push_str(args_fragment);
+                    if let Some(function) = tc.get("function") {
+                        if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
+                            st.name.get_or_insert_with(|| name.to_string());
+                        }
+                        if let Some(args_fragment) = function.get("arguments").and_then(|a| a.as_str())
+                        {
+                            st.arguments.push_str(args_fragment);
+                        }
                     }
                 }
             }
 
+            // --- Старый формат: delta.function_call ---
             if let Some(function_call) = choice
                 .get("delta")
                 .and_then(|d| d.get("function_call"))
                 .and_then(|fc| fc.as_object())
             {
-                fn_call_state.active = true;
+                legacy_fn.active = true;
 
                 if let Some(name) = function_call.get("name").and_then(|n| n.as_str()) {
-                    fn_call_state.name.get_or_insert_with(|| name.to_string());
+                    legacy_fn.name.get_or_insert_with(|| name.to_string());
                 }
 
                 if let Some(args_fragment) = function_call.get("arguments").and_then(|a| a.as_str())
                 {
-                    fn_call_state.arguments.push_str(args_fragment);
+                    legacy_fn.arguments.push_str(args_fragment);
                 }
             }
 
-            // Emit end-of-turn when finish_reason signals completion.
+            // --- Полный message.tool_calls без дельт (некоторые провайдеры) ---
+            if let Some(full_tcs) = choice
+                .get("message")
+                .and_then(|m| m.get("tool_calls"))
+                .and_then(|tc| tc.as_array())
+            {
+                for (i, tc) in full_tcs.iter().enumerate() {
+                    ensure_tc_len(&mut tool_calls, i);
+                    let st = &mut tool_calls[i];
+                    st.active = true;
+
+                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                        st.call_id.get_or_insert_with(|| id.to_string());
+                    }
+                    if let Some(function) = tc.get("function") {
+                        if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
+                            st.name.get_or_insert_with(|| name.to_string());
+                        }
+                        if let Some(args) = function.get("arguments").and_then(|a| a.as_str()) {
+                            st.arguments.push_str(args);
+                        }
+                    }
+                }
+            }
+
+            // --- Завершение тёрна ---
             if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                 match finish_reason {
-                    "tool_calls" | "function_call" if fn_call_state.active => {
-                        // First, flush the terminal raw reasoning so UIs can finalize
-                        // the reasoning stream before any exec/tool events begin.
+                    "tool_calls" => {
+                        // Сначала финализируем reasoning
                         if !reasoning_text.is_empty() {
                             let item = ResponseItem::Reasoning {
                                 id: String::new(),
@@ -602,19 +627,65 @@ async fn process_chat_sse<S>(
                             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         }
 
-                        // Then emit the FunctionCall response item.
+                        // Эмитим все собранные tool calls в порядке индексов
+                        for st in tool_calls.iter().filter(|s| s.active) {
+                            let name = st.name.clone().unwrap_or_default();
+                            let args = st.arguments.clone();
+
+                            // (Опционально) можно логировать невалидный JSON,
+                            // но не правим его - пусть выше по пайплайну решают.
+                            if let Err(e) = serde_json::from_str::<serde_json::Value>(&args) {
+                                tracing::debug!("tool_call arguments not valid JSON yet: {e}; raw kept");
+                            }
+
+                            let item = ResponseItem::FunctionCall {
+                                id: None,
+                                name,
+                                arguments: args,
+                                call_id: st.call_id.clone().unwrap_or_default(),
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+
+                        let _ = tx_event
+                            .send(Ok(ResponseEvent::Completed {
+                                response_id: String::new(),
+                                token_usage: None,
+                            }))
+                            .await;
+                        return;
+                    }
+                    "function_call" if legacy_fn.active => {
+                        if !reasoning_text.is_empty() {
+                            let item = ResponseItem::Reasoning {
+                                id: String::new(),
+                                summary: Vec::new(),
+                                content: Some(vec![ReasoningItemContent::ReasoningText {
+                                    text: std::mem::take(&mut reasoning_text),
+                                }]),
+                                encrypted_content: None,
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+
                         let item = ResponseItem::FunctionCall {
                             id: None,
-                            name: fn_call_state.name.clone().unwrap_or_else(|| "".to_string()),
-                            arguments: fn_call_state.arguments.clone(),
-                            call_id: fn_call_state.call_id.clone().unwrap_or_else(String::new),
+                            name: legacy_fn.name.unwrap_or_default(),
+                            arguments: legacy_fn.arguments,
+                            call_id: legacy_fn.call_id.unwrap_or_default(),
                         };
-
                         let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+
+                        let _ = tx_event
+                            .send(Ok(ResponseEvent::Completed {
+                                response_id: String::new(),
+                                token_usage: None,
+                            }))
+                            .await;
+                        return;
                     }
                     "stop" => {
-                        // Regular turn without tool-call. Emit the final assistant message
-                        // as a single OutputItemDone so non-delta consumers see the result.
+                        // Обычная остановка — финализируем ассистентский текст и reasoning
                         if !assistant_text.is_empty() {
                             let item = ResponseItem::Message {
                                 role: "assistant".to_string(),
@@ -625,7 +696,6 @@ async fn process_chat_sse<S>(
                             };
                             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         }
-                        // Also emit a terminal Reasoning item so UIs can finalize raw reasoning.
                         if !reasoning_text.is_empty() {
                             let item = ResponseItem::Reasoning {
                                 id: String::new(),
@@ -637,22 +707,17 @@ async fn process_chat_sse<S>(
                             };
                             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         }
+
+                        let _ = tx_event
+                            .send(Ok(ResponseEvent::Completed {
+                                response_id: String::new(),
+                                token_usage: None,
+                            }))
+                            .await;
+                        return;
                     }
                     _ => {}
                 }
-
-                // Emit Completed regardless of reason so the agent can advance.
-                let _ = tx_event
-                    .send(Ok(ResponseEvent::Completed {
-                        response_id: String::new(),
-                        token_usage: None,
-                    }))
-                    .await;
-
-                // Prepare for potential next turn (should not happen in same stream).
-                // fn_call_state = FunctionCallState::default();
-
-                return; // End processing for this SSE stream.
             }
         }
     }
@@ -707,10 +772,6 @@ where
                 Poll::Ready(None) => return Poll::Ready(None),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
                 Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(item)))) => {
-                    // If this is an incremental assistant message chunk, accumulate but
-                    // do NOT emit yet. Forward any other item (e.g. FunctionCall) right
-                    // away so downstream consumers see it.
-
                     let is_assistant_message = matches!(
                         &item,
                         codex_protocol::models::ResponseItem::Message { role, .. } if role == "assistant"
@@ -719,34 +780,23 @@ where
                     if is_assistant_message {
                         match this.mode {
                             AggregateMode::AggregatedOnly => {
-                                // Only use the final assistant message if we have not
-                                // seen any deltas; otherwise, deltas already built the
-                                // cumulative text and this would duplicate it.
                                 if this.cumulative.is_empty()
                                     && let codex_protocol::models::ResponseItem::Message {
-                                        content,
-                                        ..
-                                    } = &item
+                                    content,
+                                    ..
+                                } = &item
                                     && let Some(text) = content.iter().find_map(|c| match c {
-                                        codex_protocol::models::ContentItem::OutputText {
-                                            text,
-                                        } => Some(text),
-                                        _ => None,
-                                    })
+                                    codex_protocol::models::ContentItem::OutputText { text } => Some(text),
+                                    _ => None,
+                                })
                                 {
                                     this.cumulative.push_str(text);
                                 }
-                                // Swallow assistant message here; emit on Completed.
                                 continue;
                             }
                             AggregateMode::Streaming => {
-                                // In streaming mode, if we have not seen any deltas, forward
-                                // the final assistant message directly. If deltas were seen,
-                                // suppress the final message to avoid duplication.
                                 if this.cumulative.is_empty() {
-                                    return Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(
-                                        item,
-                                    ))));
+                                    return Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(item))));
                                 } else {
                                     continue;
                                 }
@@ -754,17 +804,15 @@ where
                         }
                     }
 
-                    // Not an assistant message – forward immediately.
                     return Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(item))));
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::RateLimits(snapshot)))) => {
                     return Poll::Ready(Some(Ok(ResponseEvent::RateLimits(snapshot))));
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::Completed {
-                    response_id,
-                    token_usage,
-                }))) => {
-                    // Build any aggregated items in the correct order: Reasoning first, then Message.
+                                        response_id,
+                                        token_usage,
+                                    }))) => {
                     let mut emitted_any = false;
 
                     if !this.cumulative_reasoning.is_empty()
@@ -786,11 +834,6 @@ where
                         emitted_any = true;
                     }
 
-                    // Always emit the final aggregated assistant message when any
-                    // content deltas have been observed. In AggregatedOnly mode this
-                    // is the sole assistant output; in Streaming mode this finalizes
-                    // the streamed deltas into a terminal OutputItemDone so callers
-                    // can persist/render the message once per turn.
                     if !this.cumulative.is_empty() {
                         let aggregated_message = codex_protocol::models::ResponseItem::Message {
                             id: None,
@@ -804,44 +847,35 @@ where
                         emitted_any = true;
                     }
 
-                    // Always emit Completed last when anything was aggregated.
                     if emitted_any {
                         this.pending.push_back(ResponseEvent::Completed {
                             response_id: response_id.clone(),
                             token_usage: token_usage.clone(),
                         });
-                        // Return the first pending event now.
                         if let Some(ev) = this.pending.pop_front() {
                             return Poll::Ready(Some(Ok(ev)));
                         }
                     }
 
-                    // Nothing aggregated – forward Completed directly.
                     return Poll::Ready(Some(Ok(ResponseEvent::Completed {
                         response_id,
                         token_usage,
                     })));
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::Created))) => {
-                    // These events are exclusive to the Responses API and
-                    // will never appear in a Chat Completions stream.
                     continue;
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::OutputTextDelta(delta)))) => {
-                    // Always accumulate deltas so we can emit a final OutputItemDone at Completed.
                     this.cumulative.push_str(&delta);
                     if matches!(this.mode, AggregateMode::Streaming) {
-                        // In streaming mode, also forward the delta immediately.
                         return Poll::Ready(Some(Ok(ResponseEvent::OutputTextDelta(delta))));
                     } else {
                         continue;
                     }
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::ReasoningContentDelta(delta)))) => {
-                    // Always accumulate reasoning deltas so we can emit a final Reasoning item at Completed.
                     this.cumulative_reasoning.push_str(&delta);
                     if matches!(this.mode, AggregateMode::Streaming) {
-                        // In streaming mode, also forward the delta immediately.
                         return Poll::Ready(Some(Ok(ResponseEvent::ReasoningContentDelta(delta))));
                     } else {
                         continue;
@@ -863,25 +897,6 @@ where
 
 /// Extension trait that activates aggregation on any stream of [`ResponseEvent`].
 pub(crate) trait AggregateStreamExt: Stream<Item = Result<ResponseEvent>> + Sized {
-    /// Returns a new stream that emits **only** the final assistant message
-    /// per turn instead of every incremental delta.  The produced
-    /// `ResponseEvent` sequence for a typical text turn looks like:
-    ///
-    /// ```ignore
-    ///     OutputItemDone(<full message>)
-    ///     Completed
-    /// ```
-    ///
-    /// No other `OutputItemDone` events will be seen by the caller.
-    ///
-    /// Usage:
-    ///
-    /// ```ignore
-    /// let agg_stream = client.stream(&prompt).await?.aggregate();
-    /// while let Some(event) = agg_stream.next().await {
-    ///     // event now contains cumulative text
-    /// }
-    /// ```
     fn aggregate(self) -> AggregatedChatStream<Self> {
         AggregatedChatStream::new(self, AggregateMode::AggregatedOnly)
     }
