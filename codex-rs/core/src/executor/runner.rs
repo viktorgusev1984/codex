@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -25,6 +26,8 @@ use crate::protocol::SandboxPolicy;
 use crate::shell;
 use crate::tools::context::ExecCommandContext;
 use codex_otel::otel_event_manager::ToolDecisionSource;
+use shlex;
+use tracing::debug;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ExecutorConfig {
@@ -239,8 +242,10 @@ fn maybe_translate_shell_command(
     session: &Session,
     use_shell_profile: bool,
 ) -> ExecParams {
-    let should_translate =
-        matches!(session.user_shell(), shell::Shell::PowerShell(_)) || use_shell_profile;
+    let requires_shell = command_requires_shell_features(&params.command);
+    let should_translate = matches!(session.user_shell(), shell::Shell::PowerShell(_))
+        || use_shell_profile
+        || requires_shell;
 
     if should_translate
         && let Some(command) = session
@@ -250,7 +255,79 @@ fn maybe_translate_shell_command(
         return ExecParams { command, ..params };
     }
 
+    if requires_shell && let Some(command) = fallback_shell_invocation(&params.command) {
+        debug!("wrapping command with fallback shell invocation");
+        return ExecParams { command, ..params };
+    }
+
     params
+}
+
+fn command_requires_shell_features(command: &[String]) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+
+    if command.len() == 1
+        && command
+            .first()
+            .is_some_and(|arg| arg.chars().any(char::is_whitespace))
+    {
+        return true;
+    }
+
+    for token in command {
+        if token.contains('\n') {
+            return true;
+        }
+
+        match token.as_str() {
+            ">" | ">>" | "<" | "<<" | "<<<" | "|" | "||" | "&&" | ";" | "|&" => {
+                return true;
+            }
+            _ => {}
+        }
+
+        if token.starts_with("2>")
+            || token.starts_with("1>")
+            || token.starts_with("&>")
+            || token.starts_with(">>")
+            || token.starts_with("<<")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn fallback_shell_invocation(command: &[String]) -> Option<Vec<String>> {
+    let script = shlex::try_join(command.iter().map(String::as_str)).ok()?;
+
+    #[cfg(unix)]
+    {
+        let env_shell = std::env::var("SHELL").ok().filter(|s| !s.is_empty());
+        let candidates = env_shell.iter().map(String::as_str).chain([
+            "/bin/bash",
+            "/usr/bin/bash",
+            "/bin/zsh",
+            "/bin/sh",
+        ]);
+
+        for candidate in candidates {
+            if Path::new(candidate).exists() {
+                return Some(vec![candidate.to_string(), "-lc".to_string(), script]);
+            }
+        }
+
+        None
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = command;
+        None
+    }
 }
 
 fn sandbox_failure_message(error: SandboxErr) -> String {
@@ -324,11 +401,13 @@ pub(crate) fn normalize_exec_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codex::make_session_and_context;
     use crate::error::CodexErr;
     use crate::error::EnvVarError;
     use crate::error::SandboxErr;
     use crate::exec::StreamOutput;
     use pretty_assertions::assert_eq;
+    use std::collections::HashMap;
 
     fn make_output(text: &str) -> ExecToolCallOutput {
         ExecToolCallOutput {
@@ -338,6 +417,17 @@ mod tests {
             aggregated_output: StreamOutput::new(text.to_string()),
             duration: Duration::from_millis(123),
             timed_out: false,
+        }
+    }
+
+    fn make_params(command: Vec<&str>) -> ExecParams {
+        ExecParams {
+            command: command.into_iter().map(str::to_string).collect(),
+            cwd: PathBuf::from("."),
+            timeout_ms: None,
+            env: HashMap::new(),
+            with_escalated_permissions: None,
+            justification: None,
         }
     }
 
@@ -405,5 +495,49 @@ mod tests {
                 .contains("Missing environment variable: `FOO`"),
             "expected synthesized user-friendly message"
         );
+    }
+
+    #[test]
+    fn translate_shell_for_redirection_without_profile() {
+        let (mut session, _ctx) = make_session_and_context();
+        session.services.user_shell = shell::Shell::Bash(shell::BashShell {
+            shell_path: "/bin/bash".to_string(),
+            bashrc_path: "/etc/bashrc".to_string(),
+        });
+        let params = make_params(vec!["printf", "hello", ">", "file.txt"]);
+
+        let translated = maybe_translate_shell_command(params, &session, false);
+
+        assert_eq!(
+            translated.command.first().map(String::as_str),
+            Some("/bin/bash")
+        );
+        assert_eq!(translated.command.get(1).map(String::as_str), Some("-lc"));
+        let script = translated
+            .command
+            .get(2)
+            .expect("expected shell script argument");
+        assert!(script.contains('>'));
+        assert!(script.contains("file.txt"));
+        assert!(script.contains("printf"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_shell_handles_unknown_user_shell() {
+        let (session, _ctx) = make_session_and_context();
+        let params = make_params(vec!["printf", "hello", ">", "file.txt"]);
+
+        let translated = maybe_translate_shell_command(params, &session, false);
+
+        assert_eq!(translated.command.len(), 3);
+        assert_eq!(translated.command.get(1).map(String::as_str), Some("-lc"));
+        let script = translated
+            .command
+            .get(2)
+            .expect("expected fallback script argument");
+        assert!(script.contains('>'));
+        assert!(script.contains("file.txt"));
+        assert!(script.contains("printf"));
     }
 }
