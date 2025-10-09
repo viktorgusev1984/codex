@@ -62,6 +62,7 @@ pub struct EventProcessorWithJsonOutput {
     last_total_token_usage: Option<codex_core::protocol::TokenUsage>,
     running_mcp_tool_calls: HashMap<String, RunningMcpToolCall>,
     last_critical_error: Option<ThreadErrorEvent>,
+    streamed_agent_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,6 +95,7 @@ impl EventProcessorWithJsonOutput {
             last_total_token_usage: None,
             running_mcp_tool_calls: HashMap::new(),
             last_critical_error: None,
+            streamed_agent_message: None,
         }
     }
 
@@ -116,7 +118,10 @@ impl EventProcessorWithJsonOutput {
                 }
                 Vec::new()
             }
-            EventMsg::TaskStarted(ev) => self.handle_task_started(ev),
+            EventMsg::TaskStarted(ev) => {
+                self.streamed_agent_message = None;
+                self.handle_task_started(ev)
+            }
             EventMsg::TaskComplete(_) => self.handle_task_complete(),
             EventMsg::Error(ev) => {
                 let error = ThreadErrorEvent {
@@ -129,6 +134,11 @@ impl EventProcessorWithJsonOutput {
                 message: ev.message.clone(),
             })],
             EventMsg::PlanUpdate(ev) => self.handle_plan_update(ev),
+            EventMsg::AgentMessageDelta(ev) => {
+                let message = self.streamed_agent_message.get_or_insert_with(String::new);
+                message.push_str(&ev.delta);
+                Vec::new()
+            }
             _ => Vec::new(),
         }
     }
@@ -158,7 +168,9 @@ impl EventProcessorWithJsonOutput {
         vec![ThreadEvent::ItemCompleted(ItemCompletedEvent { item })]
     }
 
-    fn handle_agent_message(&self, payload: &AgentMessageEvent) -> Vec<ThreadEvent> {
+    fn handle_agent_message(&mut self, payload: &AgentMessageEvent) -> Vec<ThreadEvent> {
+        self.streamed_agent_message = Some(payload.message.clone());
+
         let item = ThreadItem {
             id: self.get_next_item_id(),
 
@@ -420,6 +432,50 @@ impl EventProcessorWithJsonOutput {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_processor::EventProcessor;
+    use codex_core::protocol::AgentMessageDeltaEvent;
+    use codex_core::protocol::TaskCompleteEvent;
+    use std::fs;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn task_complete_writes_streamed_message_to_last_message_file() {
+        let file = NamedTempFile::new().expect("should create temp file");
+        let path = file.path().to_path_buf();
+        let mut processor = EventProcessorWithJsonOutput::new(Some(path.clone()));
+
+        let status = processor.process_event(Event {
+            id: "delta1".to_string(),
+            msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                delta: "Hello".to_string(),
+            }),
+        });
+        assert!(matches!(status, CodexStatus::Running));
+
+        let status = processor.process_event(Event {
+            id: "delta2".to_string(),
+            msg: EventMsg::AgentMessageDelta(AgentMessageDeltaEvent {
+                delta: ", world!".to_string(),
+            }),
+        });
+        assert!(matches!(status, CodexStatus::Running));
+
+        let status = processor.process_event(Event {
+            id: "complete".to_string(),
+            msg: EventMsg::TaskComplete(TaskCompleteEvent {
+                last_agent_message: None,
+            }),
+        });
+        assert!(matches!(status, CodexStatus::InitiateShutdown));
+
+        let written = fs::read_to_string(path).expect("should read last message file");
+        assert_eq!(written, "Hello, world!");
+    }
+}
+
 impl EventProcessor for EventProcessorWithJsonOutput {
     fn print_config_summary(&mut self, _: &Config, _: &str, ev: &SessionConfiguredEvent) {
         self.process_event(Event {
@@ -445,9 +501,11 @@ impl EventProcessor for EventProcessorWithJsonOutput {
         let Event { msg, .. } = event;
 
         if let EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) = msg {
+            let final_message = last_agent_message.or_else(|| self.streamed_agent_message.clone());
             if let Some(output_file) = self.last_message_path.as_deref() {
-                handle_last_message(last_agent_message.as_deref(), output_file);
+                handle_last_message(final_message.as_deref(), output_file);
             }
+            self.streamed_agent_message = None;
             CodexStatus::InitiateShutdown
         } else {
             CodexStatus::Running

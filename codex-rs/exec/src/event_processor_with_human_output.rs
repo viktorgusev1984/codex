@@ -1,6 +1,7 @@
 use codex_common::elapsed::format_duration;
 use codex_common::elapsed::format_elapsed;
 use codex_core::config::Config;
+use codex_core::protocol::AgentMessageDeltaEvent;
 use codex_core::protocol::AgentMessageEvent;
 use codex_core::protocol::AgentReasoningRawContentEvent;
 use codex_core::protocol::BackgroundEventEvent;
@@ -61,6 +62,7 @@ pub(crate) struct EventProcessorWithHumanOutput {
     last_message_path: Option<PathBuf>,
     last_total_token_usage: Option<codex_core::protocol::TokenUsageInfo>,
     final_message: Option<String>,
+    streamed_agent_message: Option<String>,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -86,6 +88,7 @@ impl EventProcessorWithHumanOutput {
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
+                streamed_agent_message: None,
             }
         } else {
             Self {
@@ -102,6 +105,7 @@ impl EventProcessorWithHumanOutput {
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
+                streamed_agent_message: None,
             }
         }
     }
@@ -169,14 +173,18 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             EventMsg::TaskStarted(_) => {
                 // Ignore.
+                self.streamed_agent_message = None;
             }
             EventMsg::TaskComplete(TaskCompleteEvent { last_agent_message }) => {
-                let last_message = last_agent_message.as_deref();
+                let final_message =
+                    last_agent_message.or_else(|| self.streamed_agent_message.clone());
+
                 if let Some(output_file) = self.last_message_path.as_deref() {
-                    handle_last_message(last_message, output_file);
+                    handle_last_message(final_message.as_deref(), output_file);
                 }
 
-                self.final_message = last_agent_message;
+                self.final_message = final_message;
+                self.streamed_agent_message = None;
 
                 return CodexStatus::InitiateShutdown;
             }
@@ -201,12 +209,17 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
             }
             EventMsg::AgentMessage(AgentMessageEvent { message }) => {
+                self.streamed_agent_message = Some(message.clone());
                 ts_msg!(
                     self,
                     "{}\n{}",
                     "codex".style(self.italic).style(self.magenta),
                     message,
                 );
+            }
+            EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
+                let message = self.streamed_agent_message.get_or_insert_with(String::new);
+                message.push_str(&delta);
             }
             EventMsg::ExecCommandBegin(ExecCommandBeginEvent { command, cwd, .. }) => {
                 eprint!(
@@ -500,12 +513,15 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             EventMsg::TurnAborted(abort_reason) => match abort_reason.reason {
                 TurnAbortReason::Interrupted => {
+                    self.streamed_agent_message = None;
                     ts_msg!(self, "task interrupted");
                 }
                 TurnAbortReason::Replaced => {
+                    self.streamed_agent_message = None;
                     ts_msg!(self, "task aborted: replaced by a new task");
                 }
                 TurnAbortReason::ReviewEnded => {
+                    self.streamed_agent_message = None;
                     ts_msg!(self, "task aborted: review ended");
                 }
             },
@@ -514,7 +530,6 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             EventMsg::UserMessage(_) => {}
             EventMsg::EnteredReviewMode(_) => {}
             EventMsg::ExitedReviewMode(_) => {}
-            EventMsg::AgentMessageDelta(_) => {}
             EventMsg::AgentReasoningDelta(_) => {}
             EventMsg::AgentReasoningRawContentDelta(_) => {}
         }
