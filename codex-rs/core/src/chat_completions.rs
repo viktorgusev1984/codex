@@ -548,7 +548,10 @@ async fn process_chat_sse<S>(
                 .and_then(|tc| tc.as_array())
             {
                 for tc in tool_calls_delta {
-                    let idx = tc.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+                    let idx = tc
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as usize;
                     ensure_tc_len(&mut tool_calls, idx);
                     let st = &mut tool_calls[idx];
                     st.active = true;

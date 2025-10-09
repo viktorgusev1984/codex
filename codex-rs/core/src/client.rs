@@ -163,7 +163,8 @@ impl ModelClient {
 
         let status = response.status();
         if !status.is_success() {
-            let request_id = parse_header_str(response.headers(), "cf-ray").map(std::string::ToString::to_string);
+            let request_id = parse_header_str(response.headers(), "cf-ray")
+                .map(std::string::ToString::to_string);
             let body = response.text().await.unwrap_or_default();
             return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
                 status,

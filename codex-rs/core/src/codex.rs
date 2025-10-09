@@ -2147,6 +2147,85 @@ async fn replace_invalid_tool_arguments_from_retrieved_response(
     }
 }
 
+async fn retry_tool_calls_with_repaired_arguments(
+    router: Arc<ToolRouter>,
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    turn_diff_tracker: SharedTurnDiffTracker,
+    sub_id: &str,
+    processed_items: &mut [ProcessedResponseItem],
+) -> CodexResult<()> {
+    for processed in processed_items.iter_mut() {
+        let Some(response) = processed.response.as_ref() else {
+            continue;
+        };
+
+        let ResponseItem::FunctionCall {
+            name,
+            call_id,
+            arguments,
+            ..
+        } = &processed.item
+        else {
+            continue;
+        };
+
+        let ResponseInputItem::FunctionCallOutput { output, .. } = response else {
+            continue;
+        };
+
+        if !output
+            .content
+            .contains("failed to parse function arguments")
+        {
+            continue;
+        }
+
+        if serde_json::from_str::<serde_json::Value>(arguments).is_err() {
+            continue;
+        }
+
+        info!(
+            tool_name = %name,
+            call_id = %call_id,
+            "retrying tool call with repaired arguments",
+        );
+
+        let call = match ToolRouter::build_tool_call(sess.as_ref(), processed.item.clone()) {
+            Ok(Some(call)) => call,
+            Ok(None) => continue,
+            Err(FunctionCallError::Fatal(message)) => return Err(CodexErr::Fatal(message)),
+            Err(err) => {
+                warn!(
+                    tool_name = %name,
+                    call_id = %call_id,
+                    "failed to rebuild tool call for retry: {err}",
+                );
+                continue;
+            }
+        };
+
+        match router
+            .dispatch_tool_call(
+                Arc::clone(&sess),
+                Arc::clone(&turn_context),
+                Arc::clone(&turn_diff_tracker),
+                sub_id.to_string(),
+                call,
+            )
+            .await
+        {
+            Ok(response) => {
+                processed.response = Some(response);
+            }
+            Err(FunctionCallError::Fatal(message)) => return Err(CodexErr::Fatal(message)),
+            Err(err) => return Err(CodexErr::Fatal(err.to_string())),
+        }
+    }
+
+    Ok(())
+}
+
 async fn try_run_turn(
     router: Arc<ToolRouter>,
     sess: Arc<Session>,
@@ -2350,6 +2429,16 @@ async fn try_run_turn(
                         &mut processed_items,
                     )
                     .await;
+
+                    retry_tool_calls_with_repaired_arguments(
+                        Arc::clone(&router),
+                        Arc::clone(&sess),
+                        Arc::clone(&turn_context),
+                        Arc::clone(&turn_diff_tracker),
+                        sub_id,
+                        &mut processed_items,
+                    )
+                    .await?;
                 }
 
                 let unified_diff = {
