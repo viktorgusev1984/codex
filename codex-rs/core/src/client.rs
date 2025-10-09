@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::OnceLock;
@@ -13,6 +14,7 @@ use codex_protocol::ConversationId;
 use eventsource_stream::Eventsource;
 use futures::prelude::*;
 use regex_lite::Regex;
+use reqwest::Method;
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
@@ -117,6 +119,84 @@ impl ModelClient {
         self.config.model_auto_compact_token_limit.or_else(|| {
             get_model_info(&self.config.model_family).and_then(|info| info.auto_compact_token_limit)
         })
+    }
+
+    pub async fn retrieve_tool_call_arguments(
+        &self,
+        response_id: &str,
+    ) -> Result<HashMap<String, String>> {
+        if self.provider.wire_api != WireApi::Responses {
+            return Ok(HashMap::new());
+        }
+
+        let auth_manager = self.auth_manager.clone();
+        let auth = auth_manager.as_ref().and_then(|m| m.auth());
+
+        let mut url = reqwest::Url::parse(&self.provider.get_full_url(&auth))
+            .map_err(|err| CodexErr::Fatal(format!("invalid responses endpoint URL: {err}")))?;
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                CodexErr::Fatal("responses endpoint URL cannot be a base".to_string())
+            })?;
+            segments.push(response_id);
+        }
+
+        let mut req_builder = self
+            .provider
+            .create_request_builder_with_method(&self.client, &auth, Method::GET, url)
+            .await?
+            .header("OpenAI-Beta", "responses=experimental")
+            .header("conversation_id", self.conversation_id.to_string())
+            .header("session_id", self.conversation_id.to_string());
+
+        if let Some(auth) = auth.as_ref()
+            && auth.mode == AuthMode::ChatGPT
+            && let Some(account_id) = auth.get_account_id()
+        {
+            req_builder = req_builder.header("chatgpt-account-id", account_id);
+        }
+
+        let response = self
+            .otel_event_manager
+            .log_request(0, || req_builder.send())
+            .await?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let request_id = parse_header_str(response.headers(), "cf-ray").map(std::string::ToString::to_string);
+            let body = response.text().await.unwrap_or_default();
+            return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
+                status,
+                body,
+                request_id,
+            }));
+        }
+
+        let body: serde_json::Value = response.json().await?;
+        let mut arguments_by_call_id = HashMap::new();
+        if let Some(items) = body.get("output").and_then(|v| v.as_array()) {
+            for item in items {
+                if item.get("type").and_then(|v| v.as_str()) != Some("function_call") {
+                    continue;
+                }
+
+                let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+
+                let arguments = item.get("arguments").and_then(|v| v.as_str()).or_else(|| {
+                    item.get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .and_then(|v| v.as_str())
+                });
+
+                if let Some(arguments) = arguments {
+                    arguments_by_call_id.insert(call_id.to_string(), arguments.to_string());
+                }
+            }
+        }
+
+        Ok(arguments_by_call_id)
     }
 
     /// Dispatches to either the Responses or Chat implementation depending on

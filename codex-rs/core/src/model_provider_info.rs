@@ -7,6 +7,7 @@
 
 use crate::CodexAuth;
 use codex_app_server_protocol::AuthMode;
+use reqwest::Method;
 use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -102,6 +103,21 @@ impl ModelProviderInfo {
         client: &'a reqwest::Client,
         auth: &Option<CodexAuth>,
     ) -> crate::error::Result<reqwest::RequestBuilder> {
+        let url = self.get_full_url(auth);
+        let url = reqwest::Url::parse(&url)
+            .map_err(|err| crate::error::CodexErr::Fatal(format!("invalid provider url: {err}")))?;
+
+        self.create_request_builder_with_method(client, auth, Method::POST, url)
+            .await
+    }
+
+    pub async fn create_request_builder_with_method(
+        &self,
+        client: &reqwest::Client,
+        auth: &Option<CodexAuth>,
+        method: Method,
+        url: reqwest::Url,
+    ) -> crate::error::Result<reqwest::RequestBuilder> {
         let effective_auth = match self.api_key() {
             Ok(Some(key)) => Some(CodexAuth::from_api_key(&key)),
             Ok(None) => auth.clone(),
@@ -114,9 +130,7 @@ impl ModelProviderInfo {
             }
         };
 
-        let url = self.get_full_url(&effective_auth);
-
-        let mut builder = client.post(url);
+        let mut builder = client.request(method, url);
 
         if let Some(auth) = effective_auth.as_ref() {
             builder = builder.bearer_auth(auth.get_token().await?);

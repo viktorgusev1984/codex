@@ -529,9 +529,9 @@ async fn process_chat_sse<S>(
                     }
                 } else if let Some(obj) = message_reasoning.as_object()
                     && let Some(s) = obj
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| obj.get("content").and_then(|v| v.as_str()))
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("content").and_then(|v| v.as_str()))
                     && !s.is_empty()
                 {
                     reasoning_text.push_str(s);
@@ -548,7 +548,7 @@ async fn process_chat_sse<S>(
                 .and_then(|tc| tc.as_array())
             {
                 for tc in tool_calls_delta {
-                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let idx = tc.get("index").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
                     ensure_tc_len(&mut tool_calls, idx);
                     let st = &mut tool_calls[idx];
                     st.active = true;
@@ -561,7 +561,8 @@ async fn process_chat_sse<S>(
                         if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
                             st.name.get_or_insert_with(|| name.to_string());
                         }
-                        if let Some(args_fragment) = function.get("arguments").and_then(|a| a.as_str())
+                        if let Some(args_fragment) =
+                            function.get("arguments").and_then(|a| a.as_str())
                         {
                             st.arguments.push_str(args_fragment);
                         }
@@ -637,7 +638,9 @@ async fn process_chat_sse<S>(
                             // (Опционально) можно логировать невалидный JSON,
                             // но не правим его - пусть выше по пайплайну решают.
                             if let Err(e) = serde_json::from_str::<serde_json::Value>(&args) {
-                                tracing::debug!("tool_call arguments not valid JSON yet: {e}; raw kept");
+                                tracing::debug!(
+                                    "tool_call arguments not valid JSON yet: {e}; raw kept"
+                                );
                             }
 
                             let item = ResponseItem::FunctionCall {
@@ -784,13 +787,15 @@ where
                             AggregateMode::AggregatedOnly => {
                                 if this.cumulative.is_empty()
                                     && let codex_protocol::models::ResponseItem::Message {
-                                    content,
-                                    ..
-                                } = &item
+                                        content,
+                                        ..
+                                    } = &item
                                     && let Some(text) = content.iter().find_map(|c| match c {
-                                    codex_protocol::models::ContentItem::OutputText { text } => Some(text),
-                                    _ => None,
-                                })
+                                        codex_protocol::models::ContentItem::OutputText {
+                                            text,
+                                        } => Some(text),
+                                        _ => None,
+                                    })
                                 {
                                     this.cumulative.push_str(text);
                                 }
@@ -798,7 +803,9 @@ where
                             }
                             AggregateMode::Streaming => {
                                 if this.cumulative.is_empty() {
-                                    return Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(item))));
+                                    return Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(
+                                        item,
+                                    ))));
                                 } else {
                                     continue;
                                 }
@@ -812,9 +819,9 @@ where
                     return Poll::Ready(Some(Ok(ResponseEvent::RateLimits(snapshot))));
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::Completed {
-                                        response_id,
-                                        token_usage,
-                                    }))) => {
+                    response_id,
+                    token_usage,
+                }))) => {
                     let mut emitted_any = false;
 
                     if !this.cumulative_reasoning.is_empty()

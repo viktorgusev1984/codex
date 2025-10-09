@@ -60,6 +60,7 @@ use crate::executor::normalize_exec_result;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_family::find_family_for_model;
+use crate::model_provider_info::WireApi;
 use crate::openai_model_info::get_model_info;
 use crate::openai_tools::ToolsConfig;
 use crate::openai_tools::ToolsConfigParams;
@@ -1949,14 +1950,15 @@ fn sanitize_response_item(mut item: ResponseItem) -> ResponseItem {
         call_id,
         ..
     } = &mut item
-        && let Some(fixed) = repair_tool_arguments(arguments.as_str()) {
-            warn!(
-                tool_name = %name,
-                call_id = %call_id,
-                "synthesized missing closing delimiters for stored tool arguments"
-            );
-            *arguments = fixed;
-        }
+        && let Some(fixed) = repair_tool_arguments(arguments.as_str())
+    {
+        warn!(
+            tool_name = %name,
+            call_id = %call_id,
+            "synthesized missing closing delimiters for stored tool arguments"
+        );
+        *arguments = fixed;
+    }
 
     item
 }
@@ -2070,6 +2072,79 @@ pub(crate) struct ProcessedResponseItem {
 struct TurnRunResult {
     processed_items: Vec<ProcessedResponseItem>,
     total_token_usage: Option<TokenUsage>,
+}
+
+async fn replace_invalid_tool_arguments_from_retrieved_response(
+    client: &ModelClient,
+    response_id: &str,
+    processed_items: &mut [ProcessedResponseItem],
+) {
+    let needs_repair = processed_items.iter().any(|processed| {
+        matches!(
+            &processed.item,
+            ResponseItem::FunctionCall { arguments, .. }
+                if serde_json::from_str::<serde_json::Value>(arguments).is_err()
+        )
+    });
+
+    if !needs_repair {
+        return;
+    }
+
+    match client.retrieve_tool_call_arguments(response_id).await {
+        Ok(replacements) => {
+            if replacements.is_empty() {
+                return;
+            }
+
+            for processed in processed_items.iter_mut() {
+                if let ResponseItem::FunctionCall {
+                    arguments,
+                    call_id,
+                    name,
+                    ..
+                } = &mut processed.item
+                {
+                    if serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
+                        continue;
+                    }
+
+                    match replacements.get(call_id) {
+                        Some(new_arguments)
+                            if serde_json::from_str::<serde_json::Value>(new_arguments).is_ok() =>
+                        {
+                            warn!(
+                                tool_name = %name,
+                                call_id = %call_id,
+                                "replaced invalid tool arguments from retrieved response",
+                            );
+                            *arguments = new_arguments.clone();
+                        }
+                        Some(_) => {
+                            debug!(
+                                tool_name = %name,
+                                call_id = %call_id,
+                                "retrieved tool arguments were still invalid; keeping original",
+                            );
+                        }
+                        None => {
+                            debug!(
+                                tool_name = %name,
+                                call_id = %call_id,
+                                "retrieved response missing arguments for tool call; keeping original",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            warn!(
+                response_id = %response_id,
+                "failed to retrieve response for tool argument repair: {err}",
+            );
+        }
+    }
 }
 
 async fn try_run_turn(
@@ -2258,13 +2333,24 @@ async fn try_run_turn(
                 sess.update_rate_limits(sub_id, snapshot).await;
             }
             ResponseEvent::Completed {
-                response_id: _,
+                response_id,
                 token_usage,
             } => {
                 sess.update_token_usage_info(sub_id, turn_context.as_ref(), token_usage.as_ref())
                     .await;
 
-                let processed_items: Vec<ProcessedResponseItem> = output.try_collect().await?;
+                let mut processed_items: Vec<ProcessedResponseItem> = output.try_collect().await?;
+
+                if turn_context.client.get_provider().wire_api == WireApi::Responses
+                    && !response_id.is_empty()
+                {
+                    replace_invalid_tool_arguments_from_retrieved_response(
+                        &turn_context.client,
+                        &response_id,
+                        &mut processed_items,
+                    )
+                    .await;
+                }
 
                 let unified_diff = {
                     let mut tracker = turn_diff_tracker.lock().await;
