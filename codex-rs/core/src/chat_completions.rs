@@ -314,7 +314,7 @@ pub(crate) async fn stream_chat_completions(
         let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
 
         // финальная попытка починить tool_calls прямо в сообщениях
-        let _ = preflight_repair_messages(&mut messages);
+        let _ = strip_broken_tool_calls_and_add_repair_prompt(&mut messages);
 
         let payload = json!({
     "model": model_family.slug,
@@ -358,32 +358,28 @@ pub(crate) async fn stream_chat_completions(
                 let headers = res.headers().clone();
                 let body = res.text().await.unwrap_or_default();
 
+                // Спец-кейс: 400 + "Extra data" (обычно из-за склеенных JSON-объектов в arguments)
                 if status == StatusCode::BAD_REQUEST && body.contains("Extra data") {
-                    // Повтор: удаляем все сломанные tool_calls и просим модель переиздать
-                    let mut retry_messages = messages.clone();
-                    let had_broken = strip_broken_tool_calls_and_add_repair_prompt(&mut retry_messages);
+                    // Не чиним сами — удаляем битые tool_calls и объясняем, что нужно переиздать
+                    if strip_broken_tool_calls_and_add_repair_prompt(&mut messages) {
+                        warn!("HTTP 400 'Extra data': stripped broken tool_calls and requested a re-emit; retrying once");
 
-                    if had_broken {
-                        warn!("HTTP 400 'Extra data': stripped broken tool_calls and requested re-issue; retrying once");
-
-                        let req_builder_retry = provider.create_request_builder(client, &None).await?;
-                        let retry_payload = json!({
-            "model": model_family.slug,
-            "messages": retry_messages,
-            "stream": true,
-            "tools": tools_json,
-        });
-
-                        let retry_res = otel_event_manager
+                        let req_builder = provider.create_request_builder(client, &None).await?;
+                        let retry_resp = otel_event_manager
                             .log_request(attempt, || {
-                                req_builder_retry
+                                req_builder
                                     .header(reqwest::header::ACCEPT, "text/event-stream")
-                                    .json(&retry_payload)
+                                    .json(&serde_json::json!({
+                        "model": model_family.slug,
+                        "messages": messages,
+                        "stream": true,
+                        "tools": tools_json,
+                    }))
                                     .send()
                             })
                             .await;
 
-                        if let Ok(retry_ok) = retry_res {
+                        if let Ok(retry_ok) = retry_resp {
                             if retry_ok.status().is_success() {
                                 let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
                                 let stream = retry_ok.bytes_stream().map_err(CodexErr::Reqwest);
@@ -398,6 +394,7 @@ pub(crate) async fn stream_chat_completions(
                         }
                     }
 
+                    // если не получилось почистить/повторить — вернуть как UnexpectedStatus
                     return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
                         status,
                         body,
@@ -449,14 +446,48 @@ fn is_valid_json_object_str(s: &str) -> bool {
     }
 }
 
-/// Удаляет сломанные tool_calls из assistant-сообщений.
-/// Если что-то удалили — добавляем в конец строгую инструкцию модели
-/// заново выпустить те же вызовы с валидным JSON-объектом в `arguments`.
+fn json_kind(v: &serde_json::Value) -> &'static str {
+    use serde_json::Value::*;
+    match v {
+        Object(_) => "object",
+        Array(_) => "array",
+        String(_) => "string",
+        Number(_) => "number",
+        Bool(_) => "boolean",
+        Null => "null",
+    }
+}
+
+/// Возвращает Ok(()) если `s` — ровно один валидный JSON-объект без лишних токенов.
+/// В противном случае Err(<человекочитаемая причина>).
+fn validate_single_json_object_str(s: &str) -> std::result::Result<(), String> {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(v) => {
+            if v.is_object() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "arguments must be a single JSON object, got {}",
+                    json_kind(&v)
+                ))
+            }
+        }
+        Err(e) => Err(format!("invalid JSON: {e}")),
+    }
+}
+
+
+
+
+/// Удаляет из assistant-сообщений все tool_calls с битым JSON в `arguments`
+/// и добавляет в конец `messages` user-подсказку с расшифровкой проблем.
+/// Возвращает true, если что-то удалили.
 fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::Value>) -> bool {
     use serde_json::Value;
-
     let mut removed_any = false;
-    let mut tool_names = std::collections::BTreeSet::<String>::new();
+
+    // для сводки по каждому инструменту
+    let mut problems: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
 
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
@@ -466,112 +497,100 @@ fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::
             continue;
         };
 
-        let mut filtered = Vec::<Value>::with_capacity(tcs.len());
+        let mut kept: Vec<Value> = Vec::with_capacity(tcs.len());
         for tc in tcs.iter() {
             let is_func = tc.get("type").and_then(Value::as_str) == Some("function");
-            if is_func {
-                let name = tc
-                    .get("function")
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-
-                let args_str_opt = tc
-                    .get("function")
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(Value::as_str);
-
-                let name_ok = !name.is_empty();
-                let args_ok = args_str_opt.map(is_valid_json_object_str).unwrap_or(false);
-
-                if !args_ok {
-                    // пометим инструмент с битым JSON
-                    tool_names.insert(name);
-                }
-
-                if name_ok && args_ok {
-                    filtered.push(tc.clone());
-                } else {
-                    removed_any = true;
-                }
-            } else {
-                // не поддерживаемые типы tool_calls тоже выпиливаем
+            if !is_func {
                 removed_any = true;
+                continue;
+            }
+
+            let name = tc
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+
+            let args_str_opt = tc
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str);
+
+            // имя инструмента должно быть
+            let name_ok = !name.is_empty();
+
+            // args должны быть ровно одним JSON-объектом
+            let (args_ok, reason_opt) = match args_str_opt {
+                Some(s) => match validate_single_json_object_str(s) {
+                    Ok(()) => (true, None),
+                    Err(reason) => (false, Some(reason)),
+                },
+                None => (false, Some("missing `arguments` string".to_string())),
+            };
+
+            if name_ok && args_ok {
+                kept.push(tc.clone());
+            } else {
+                removed_any = true;
+
+                // Соберём подробности
+                let mut notes = Vec::<String>::new();
+                if !name_ok {
+                    notes.push("missing function `name`".to_string());
+                }
+                if let Some(r) = reason_opt {
+                    // короткий сниппет аргументов для контекста
+                    let snippet = args_str_opt
+                        .map(|s| {
+                            let s = s.trim();
+                            let s = if s.len() > 160 { format!("{}…", &s[..160]) } else { s.to_string() };
+                            format!("args snippet: `{}`", s.replace('`', "'"))
+                        })
+                        .unwrap_or_else(|| "args snippet: <none>".to_string());
+
+                    notes.push(r);
+                    notes.push(snippet);
+                }
+
+                problems.entry(if name.is_empty() { "<unknown>".into() } else { name })
+                    .or_default()
+                    .extend(notes);
             }
         }
 
-        if filtered.is_empty() {
+        if kept.is_empty() {
             if let Some(obj) = msg.as_object_mut() {
                 obj.remove("tool_calls");
             }
         } else {
-            *tcs = filtered;
+            *tcs = kept;
         }
     }
 
     if removed_any {
-        let hint = if tool_names.is_empty() {
-            "Some previous tool_call arguments were invalid JSON."
-        } else {
-            "Previous tool_call arguments for the following tools were invalid JSON."
-        };
+        // Сформируем понятное пояснение для модели
+        let mut lines = Vec::<String>::new();
+        lines.push("Some previous tool call(s) were omitted because `arguments` was not a SINGLE valid JSON object.".into());
+        lines.push("Please re-emit the SAME call(s) with exactly one JSON object in `arguments` (no arrays, no multiple top-level objects, no trailing commas, no plain text).".into());
+        lines.push("Details:".into());
 
-        let list = if tool_names.is_empty() {
-            String::new()
-        } else {
-            format!(" Affected tools: {}.", tool_names.into_iter().collect::<Vec<_>>().join(", "))
-        };
+        for (tool, notes) in problems {
+            lines.push(format!("- `{}`:", tool));
+            for n in notes {
+                lines.push(format!("  • {}", n));
+            }
+        }
 
         messages.push(serde_json::json!({
             "role": "user",
-            "content": format!(
-                "{hint}{list} Re-emit the same tool call(s) with a SINGLE valid JSON object in the `arguments` field. \
-                 Do not stream multiple top-level objects, no trailing commas, and no plain text."
-            )
+            "content": lines.join("\n"),
         }));
     }
 
     removed_any
 }
 
-
-fn validate_or_repair_args(args: &str) -> String {
-    if serde_json::from_str::<Value>(args).is_ok() {
-        return args.to_string();
-    }
-    repair_tool_arguments(args).unwrap_or_else(|| args.to_string())
-}
-
-fn preflight_repair_messages(messages: &mut [serde_json::Value]) -> bool {
-    use serde_json::Value;
-    let mut changed = false;
-
-    for msg in messages.iter_mut() {
-        // assistant с tool_calls
-        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
-            if let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
-                for tc in tcs {
-                    if tc.get("type").and_then(Value::as_str) == Some("function") {
-                        if let Some(function) = tc.get_mut("function") {
-                            if let Some(args) = function.get_mut("arguments") {
-                                if let Some(raw) = args.as_str() {
-                                    if serde_json::from_str::<Value>(raw).is_err() {
-                                        if let Some(fixed) = repair_tool_arguments(raw) {
-                                            *args = Value::String(fixed);
-                                            changed = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    changed
-}
 
 /// Lightweight SSE processor for the Chat Completions streaming format. The
 /// output is mapped onto Codex's internal [`ResponseEvent`] so that the rest
