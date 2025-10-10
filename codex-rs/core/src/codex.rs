@@ -2174,22 +2174,15 @@ async fn retry_tool_calls_with_repaired_arguments(
             continue;
         };
 
-        if !output
-            .content
-            .contains("failed to parse function arguments")
-        {
+        if !output.content.contains("failed to parse function arguments") {
             continue;
         }
 
-        if serde_json::from_str::<serde_json::Value>(arguments).is_err() {
+        if serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
             continue;
         }
 
-        info!(
-            tool_name = %name,
-            call_id = %call_id,
-            "retrying tool call with repaired arguments",
-        );
+        info!(tool_name = %name, call_id = %call_id, "retrying tool call with repaired arguments (pre-exec)");
 
         let call = match ToolRouter::build_tool_call(sess.as_ref(), processed.item.clone()) {
             Ok(Some(call)) => call,
