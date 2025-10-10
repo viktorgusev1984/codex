@@ -380,6 +380,19 @@ impl ChatComposer {
 
     /// Handle a key event coming from the main UI.
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> (InputResult, bool) {
+        if key_event.kind == KeyEventKind::Release {
+            return (InputResult::None, false);
+        }
+
+        let key_event = if key_event.kind == KeyEventKind::Repeat {
+            KeyEvent {
+                kind: KeyEventKind::Press,
+                ..key_event
+            }
+        } else {
+            key_event
+        };
+
         let result = match &mut self.active_popup {
             ActivePopup::Command(_) => self.handle_key_event_with_slash_popup(key_event),
             ActivePopup::File(_) => self.handle_key_event_with_file_popup(key_event),
@@ -2359,6 +2372,68 @@ mod tests {
         assert!(composer.textarea.is_empty(), "composer should be cleared");
         composer.insert_str("@");
         assert_eq!(composer.textarea.text(), "@");
+    }
+
+    #[test]
+    fn slash_enter_release_is_ignored() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyEventKind;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'i', 'n', 'i', 't']);
+
+        let mut release = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+
+        let (result, needs_redraw) = composer.handle_key_event(release);
+
+        assert_eq!(result, InputResult::None);
+        assert!(!needs_redraw);
+        assert_eq!(composer.textarea.text(), "/init");
+    }
+
+    #[test]
+    fn slash_enter_repeat_dispatches_command() {
+        use crossterm::event::KeyCode;
+        use crossterm::event::KeyEvent;
+        use crossterm::event::KeyEventKind;
+        use crossterm::event::KeyModifiers;
+
+        let (tx, _rx) = unbounded_channel::<AppEvent>();
+        let sender = AppEventSender::new(tx);
+        let mut composer = ChatComposer::new(
+            true,
+            sender,
+            false,
+            "Ask Codex to do anything".to_string(),
+            false,
+        );
+
+        type_chars_humanlike(&mut composer, &['/', 'i', 'n', 'i', 't']);
+
+        let mut repeat = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        repeat.kind = KeyEventKind::Repeat;
+
+        let (result, _) = composer.handle_key_event(repeat);
+
+        match result {
+            InputResult::Command(cmd) => {
+                assert_eq!(cmd.command(), "init");
+            }
+            other => panic!("expected Command, got {other:?}"),
+        }
+        assert!(composer.textarea.is_empty());
     }
 
     #[test]
