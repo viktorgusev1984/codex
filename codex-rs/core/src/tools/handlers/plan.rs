@@ -12,6 +12,8 @@ use async_trait::async_trait;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
+use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
@@ -112,8 +114,211 @@ pub(crate) async fn handle_update_plan(
     Ok("Plan updated".to_string())
 }
 
+const PLAN_ARGUMENT_EXAMPLE: &str =
+    r#"Example: {"plan": [{"step": "Outline solution", "status": "in_progress"}]}"#;
+
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
-    serde_json::from_str::<UpdatePlanArgs>(arguments).map_err(|e| {
-        FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e}"))
-    })
+    let mut deserializer = serde_json::Deserializer::from_str(arguments);
+    let value: Value = Value::deserialize(&mut deserializer)
+        .map_err(|error| map_invalid_json_error(arguments, error))?;
+
+    if let Err(error) = deserializer.end() {
+        return Err(map_invalid_json_error(arguments, error));
+    }
+
+    validate_plan_arguments(&value)?;
+    serde_json::from_value(value).map_err(|error| map_invalid_json_error(arguments, error))
+}
+
+fn map_invalid_json_error(arguments: &str, error: serde_json::Error) -> FunctionCallError {
+    use serde_json::error::Category;
+
+    let hint = match error.classify() {
+        Category::Data => {
+            "Ensure `plan` is an array of objects with `step` and `status` (pending, in_progress, completed)."
+                .to_string()
+        }
+        Category::Syntax | Category::Eof => {
+            let message = error.to_string();
+            if message.contains("trailing characters") {
+                trailing_characters_hint(arguments)
+            } else {
+                "Provide the arguments as a single JSON object with a `plan` array of steps.".to_string()
+            }
+        }
+        Category::Io => "Encountered an unexpected I/O error while reading the arguments.".to_string(),
+    };
+
+    FunctionCallError::RespondToModel(format!(
+        "failed to parse function arguments: {error}. {hint} {PLAN_ARGUMENT_EXAMPLE}"
+    ))
+}
+
+fn trailing_characters_hint(arguments: &str) -> String {
+    if arguments.contains("},") {
+        return "Wrap each step object inside the `plan` array instead of sending multiple top-level JSON objects.".to_string();
+    }
+
+    if arguments.contains("\"plan\": \"") && !arguments.contains("\"plan\": [") {
+        return "Set `plan` to an array of step objects rather than a string, and include all steps inside that array.".to_string();
+    }
+
+    "Provide the arguments as a single JSON object with a `plan` array of steps.".to_string()
+}
+
+fn validate_plan_arguments(value: &Value) -> Result<(), FunctionCallError> {
+    let obj = value.as_object().ok_or_else(|| {
+        respond_with_hint(
+            "Provide the arguments as a JSON object with `plan` and optional `explanation`.",
+        )
+    })?;
+
+    if let Some(explanation) = obj.get("explanation")
+        && !(explanation.is_string() || explanation.is_null())
+    {
+        return Err(respond_with_hint(
+            "`explanation` must be a string or null when provided.",
+        ));
+    }
+
+    let plan_value = obj
+        .get("plan")
+        .ok_or_else(|| respond_with_hint("Include a `plan` array of step objects."))?;
+
+    let plan_items = plan_value.as_array().ok_or_else(|| {
+        respond_with_hint("Wrap the plan steps in an array of objects with `step` and `status`.")
+    })?;
+
+    for (index, item) in plan_items.iter().enumerate() {
+        let item_obj = item.as_object().ok_or_else(|| {
+            respond_with_hint(format!(
+                "Plan item {} must be an object with `step` and `status`.",
+                index + 1
+            ))
+        })?;
+
+        if let Some(step_value) = item_obj.get("step") {
+            if !step_value.is_string() {
+                return Err(respond_with_hint(format!(
+                    "`step` must be a string in plan item {}.",
+                    index + 1
+                )));
+            }
+        } else {
+            return Err(respond_with_hint(format!(
+                "Plan item {} is missing `step`.",
+                index + 1
+            )));
+        }
+
+        if let Some(status_value) = item_obj.get("status") {
+            let status = status_value.as_str().ok_or_else(|| {
+                respond_with_hint(format!(
+                    "`status` must be one of pending, in_progress, or completed in plan item {}.",
+                    index + 1
+                ))
+            })?;
+
+            if !matches!(status, "pending" | "in_progress" | "completed") {
+                return Err(respond_with_hint(format!(
+                    "`status` must be one of pending, in_progress, or completed in plan item {}.",
+                    index + 1
+                )));
+            }
+        } else {
+            return Err(respond_with_hint(format!(
+                "Plan item {} is missing `status`.",
+                index + 1
+            )));
+        }
+
+        let unexpected_fields: Vec<&str> = item_obj
+            .keys()
+            .filter_map(|key| {
+                if key != "step" && key != "status" {
+                    Some(key.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !unexpected_fields.is_empty() {
+            let fields = unexpected_fields.join(", ");
+            return Err(respond_with_hint(format!(
+                "Plan item {} has unsupported fields: {}. Only `step` and `status` are allowed.",
+                index + 1,
+                fields
+            )));
+        }
+    }
+
+    let unexpected_root_fields: Vec<&str> = obj
+        .keys()
+        .filter_map(|key| {
+            if key != "plan" && key != "explanation" {
+                Some(key.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if !unexpected_root_fields.is_empty() {
+        let fields = unexpected_root_fields.join(", ");
+        return Err(respond_with_hint(format!(
+            "Unsupported top-level fields: {fields}. Only `plan` and optional `explanation` are accepted."
+        )));
+    }
+
+    Ok(())
+}
+
+fn respond_with_hint(message: impl Into<String>) -> FunctionCallError {
+    let hint = message.into();
+    FunctionCallError::RespondToModel(format!(
+        "failed to parse function arguments: {hint} {PLAN_ARGUMENT_EXAMPLE}"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use codex_protocol::plan_tool::StepStatus;
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
+    #[test]
+    fn parse_update_plan_arguments_reports_trailing_content() {
+        let args = r#"{"plan": "step one"}, {"plan": "step two"}"#;
+        let error = parse_update_plan_arguments(args).expect_err("expected trailing content error");
+        match error {
+            FunctionCallError::RespondToModel(message) => {
+                assert!(
+                    message.contains("Wrap each step object inside the `plan` array"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn allows_null_explanation_and_maps_to_none() {
+        let args = parse_update_plan_arguments(
+            &json!({
+                "explanation": null,
+                "plan": [
+                    {"step": "Do something", "status": "pending"}
+                ]
+            })
+            .to_string(),
+        )
+        .expect("arguments parsed");
+
+        assert_eq!(args.explanation, None);
+        assert_eq!(args.plan.len(), 1);
+        assert_eq!(args.plan[0].step, "Do something");
+        assert!(matches!(args.plan[0].status, StepStatus::Pending));
+    }
 }
