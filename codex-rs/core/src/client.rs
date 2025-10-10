@@ -181,7 +181,11 @@ impl ModelClient {
                     continue;
                 }
 
-                let Some(call_id) = item.get("call_id").and_then(|v| v.as_str()) else {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("id").and_then(|v| v.as_str()));
+                let Some(call_id) = call_id else {
                     continue;
                 };
 

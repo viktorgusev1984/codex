@@ -443,6 +443,73 @@ async fn retrieves_tool_arguments_when_stream_delivers_invalid_json() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrieves_tool_arguments_when_response_uses_item_id_field() {
+    let server = responses::start_mock_server().await;
+
+    let invalid_arguments = "{\"sleep_before_ms\":0";
+    let first_turn = responses::sse(vec![
+        responses::ev_response_created("resp_fix"),
+        responses::ev_function_call("call-1", "test_sync_tool", invalid_arguments),
+        responses::ev_completed("resp_fix"),
+    ]);
+    let second_turn = responses::sse(vec![
+        responses::ev_response_created("resp_final"),
+        responses::ev_assistant_message("msg-1", "done"),
+        responses::ev_completed("resp_final"),
+    ]);
+
+    let _ = responses::mount_sse_sequence(&server, vec![first_turn, second_turn]).await;
+
+    Mock::given(method("GET"))
+        .and(path("/v1/responses/resp_fix"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_fix",
+            "output": [{
+                "type": "function_call",
+                "id": "call-1",
+                "name": "test_sync_tool",
+                "arguments": "{\\\"sleep_before_ms\\\":0}"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let model_provider = ModelProviderInfo {
+        base_url: Some(format!("{}/v1", server.uri())),
+        ..built_in_model_providers()["openai"].clone()
+    };
+
+    let codex_home = TempDir::new().unwrap();
+    let mut config = load_default_config_for_test(&codex_home);
+    config.model_provider = model_provider;
+    config.model = "test-gpt-5-codex".to_string();
+    config.model_family =
+        find_family_for_model("test-gpt-5-codex").expect("test-gpt-5-codex model family");
+
+    let conversation_manager =
+        ConversationManager::with_auth(CodexAuth::from_api_key("Test API Key"));
+    let NewConversation {
+        conversation: codex,
+        ..
+    } = conversation_manager
+        .new_conversation(config)
+        .await
+        .expect("create new conversation");
+
+    codex
+        .submit(Op::UserInput {
+            items: vec![InputItem::Text {
+                text: "hello".into(),
+            }],
+        })
+        .await
+        .expect("submit user input");
+
+    wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn includes_base_instructions_override_in_request() {
     skip_if_no_network!();
     // Mock server
