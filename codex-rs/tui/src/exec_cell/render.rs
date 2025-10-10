@@ -57,19 +57,35 @@ pub(crate) fn output_lines(
         include_angle_pipe,
         include_prefix,
     } = params;
-    let CommandOutput {
-        exit_code,
-        stdout,
-        stderr,
-        ..
-    } = match output {
+    let CommandOutput { stdout, stderr, .. } = match output {
         Some(output) if only_err && output.exit_code == 0 => return vec![],
         Some(output) => output,
         None => return vec![],
     };
 
-    let src = if *exit_code == 0 { stdout } else { stderr };
-    let lines: Vec<&str> = src.lines().collect();
+    let stdout_is_empty = stdout.trim().is_empty();
+    let stderr_is_empty = stderr.trim().is_empty();
+
+    let primary = if only_err {
+        stderr
+    } else if !stdout_is_empty {
+        stdout
+    } else {
+        stderr
+    };
+
+    let mut lines: Vec<&str> = primary.lines().collect();
+
+    if !only_err && !stderr_is_empty && !std::ptr::eq(primary, stderr) {
+        if !lines.is_empty() {
+            lines.push("");
+        }
+        lines.extend(stderr.lines());
+    }
+
+    if lines.is_empty() {
+        return vec![];
+    }
     let total = lines.len();
     let limit = TOOL_CALL_MAX_LINES;
 
