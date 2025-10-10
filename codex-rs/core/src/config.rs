@@ -845,7 +845,9 @@ pub struct ConfigToml {
 
 impl From<ConfigToml> for UserSavedConfig {
     fn from(config_toml: ConfigToml) -> Self {
-        let model = config_toml.model_name().map(std::string::ToString::to_string);
+        let model = config_toml
+            .model_name()
+            .map(std::string::ToString::to_string);
 
         let profiles = config_toml
             .profiles
@@ -1066,32 +1068,33 @@ impl Config {
         }
 
         if let Some(table) = inline_model_table.as_ref()
-            && let Some(provider_id) = table.provider.clone() {
-                let entry = model_providers
-                    .entry(provider_id.clone())
-                    .or_insert_with(|| ModelProviderInfo {
-                        name: provider_id.clone(),
-                        base_url: None,
-                        env_key: None,
-                        env_key_instructions: None,
-                        wire_api: Default::default(),
-                        query_params: None,
-                        http_headers: None,
-                        env_http_headers: None,
-                        request_max_retries: None,
-                        stream_max_retries: None,
-                        stream_idle_timeout_ms: None,
-                        requires_openai_auth: false,
-                    });
+            && let Some(provider_id) = table.provider.clone()
+        {
+            let entry = model_providers
+                .entry(provider_id.clone())
+                .or_insert_with(|| ModelProviderInfo {
+                    name: provider_id.clone(),
+                    base_url: None,
+                    env_key: None,
+                    env_key_instructions: None,
+                    wire_api: Default::default(),
+                    query_params: None,
+                    http_headers: None,
+                    env_http_headers: None,
+                    request_max_retries: None,
+                    stream_max_retries: None,
+                    stream_idle_timeout_ms: None,
+                    requires_openai_auth: false,
+                });
 
-                if let Some(base_url) = &table.base_url {
-                    entry.base_url = Some(base_url.clone());
-                }
-
-                if let Some(api_key_env) = &table.api_key_env {
-                    entry.env_key = Some(api_key_env.clone());
-                }
+            if let Some(base_url) = &table.base_url {
+                entry.base_url = Some(base_url.clone());
             }
+
+            if let Some(api_key_env) = &table.api_key_env {
+                entry.env_key = Some(api_key_env.clone());
+            }
+        }
 
         let model_provider_id = model_provider
             .or(config_profile.model_provider)

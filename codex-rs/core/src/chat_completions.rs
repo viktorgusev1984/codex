@@ -29,6 +29,9 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::debug;
 use tracing::trace;
+use tracing::warn;
+use crate::tool_arguments::repair_tool_arguments;
+use serde_json::Value;
 
 /// Implementation for the classic Chat Completions API.
 pub(crate) async fn stream_chat_completions(
@@ -190,25 +193,39 @@ pub(crate) async fn stream_chat_completions(
                 call_id,
                 ..
             } => {
-                let mut msg = json!({
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments,
-                        }
-                    }]
-                });
-                if let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
-                    && let Some(obj) = msg.as_object_mut()
-                {
-                    obj.insert("reasoning".to_string(), json!(reasoning));
+                // Добавляем tool_call ТОЛЬКО если arguments — валидный JSON-объект.
+                if is_valid_json_object_str(arguments) {
+                    let mut msg = json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments,
                 }
-                messages.push(msg);
+            }]
+        });
+                    if let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
+                        && let Some(obj) = msg.as_object_mut()
+                    {
+                        obj.insert("reasoning".to_string(), json!(reasoning));
+                    }
+                    messages.push(msg);
+                } else {
+                    // Не пускаем битый tool_call в payload — пометим и потом добавим user-инструкцию.
+                    messages.push(json!({
+            "role": "user",
+            "content": format!(
+                "Tool call `{}` was omitted because `arguments` was not a single valid JSON object. \
+                 Please re-emit the call with a valid JSON object only.",
+                name
+            )
+        }));
+                }
             }
+
             ResponseItem::LocalShellCall {
                 id,
                 call_id: _,
@@ -276,24 +293,42 @@ pub(crate) async fn stream_chat_completions(
         }
     }
 
-    let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
-    let payload = json!({
-        "model": model_family.slug,
-        "messages": messages,
-        "stream": true,
-        "tools": tools_json,
-    });
-
-    debug!(
-        "POST to {}: {}",
-        provider.get_full_url(&None),
-        serde_json::to_string_pretty(&payload).unwrap_or_default()
-    );
+    // let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
+    // let payload = json!({
+    //     "model": model_family.slug,
+    //     "messages": messages,
+    //     "stream": true,
+    //     "tools": tools_json,
+    // });
+    //
+    // debug!(
+    //     "POST to {}: {}",
+    //     provider.get_full_url(&None),
+    //     serde_json::to_string_pretty(&payload).unwrap_or_default()
+    // );
 
     let mut attempt = 0;
     let max_retries = provider.request_max_retries();
     loop {
         attempt += 1;
+        let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
+
+        // финальная попытка починить tool_calls прямо в сообщениях
+        let _ = preflight_repair_messages(&mut messages);
+
+        let payload = json!({
+    "model": model_family.slug,
+    "messages": messages,
+    "stream": true,
+    "tools": tools_json,
+});
+
+        debug!(
+    "POST to {}: {}",
+    provider.get_full_url(&None),
+    serde_json::to_string_pretty(&payload).unwrap_or_default()
+);
+
 
         let req_builder = provider.create_request_builder(client, &None).await?;
 
@@ -320,8 +355,58 @@ pub(crate) async fn stream_chat_completions(
             }
             Ok(res) => {
                 let status = res.status();
+                let headers = res.headers().clone();
+                let body = res.text().await.unwrap_or_default();
+
+                if status == StatusCode::BAD_REQUEST && body.contains("Extra data") {
+                    // Повтор: удаляем все сломанные tool_calls и просим модель переиздать
+                    let mut retry_messages = messages.clone();
+                    let had_broken = strip_broken_tool_calls_and_add_repair_prompt(&mut retry_messages);
+
+                    if had_broken {
+                        warn!("HTTP 400 'Extra data': stripped broken tool_calls and requested re-issue; retrying once");
+
+                        let req_builder_retry = provider.create_request_builder(client, &None).await?;
+                        let retry_payload = json!({
+            "model": model_family.slug,
+            "messages": retry_messages,
+            "stream": true,
+            "tools": tools_json,
+        });
+
+                        let retry_res = otel_event_manager
+                            .log_request(attempt, || {
+                                req_builder_retry
+                                    .header(reqwest::header::ACCEPT, "text/event-stream")
+                                    .json(&retry_payload)
+                                    .send()
+                            })
+                            .await;
+
+                        if let Ok(retry_ok) = retry_res {
+                            if retry_ok.status().is_success() {
+                                let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+                                let stream = retry_ok.bytes_stream().map_err(CodexErr::Reqwest);
+                                tokio::spawn(process_chat_sse(
+                                    stream,
+                                    tx_event,
+                                    provider.stream_idle_timeout(),
+                                    otel_event_manager.clone(),
+                                ));
+                                return Ok(ResponseStream { rx_event });
+                            }
+                        }
+                    }
+
+                    return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
+                        status,
+                        body,
+                        request_id: None,
+                    }));
+                }
+
+
                 if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
-                    let body = (res.text().await).unwrap_or_default();
                     return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
                         status,
                         body,
@@ -336,8 +421,7 @@ pub(crate) async fn stream_chat_completions(
                     }));
                 }
 
-                let retry_after_secs = res
-                    .headers()
+                let retry_after_secs = headers
                     .get(reqwest::header::RETRY_AFTER)
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse::<u64>().ok());
@@ -356,6 +440,137 @@ pub(crate) async fn stream_chat_completions(
             }
         }
     }
+}
+
+fn is_valid_json_object_str(s: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(serde_json::Value::Object(_)) => true,
+        _ => false,
+    }
+}
+
+/// Удаляет сломанные tool_calls из assistant-сообщений.
+/// Если что-то удалили — добавляем в конец строгую инструкцию модели
+/// заново выпустить те же вызовы с валидным JSON-объектом в `arguments`.
+fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::Value>) -> bool {
+    use serde_json::Value;
+
+    let mut removed_any = false;
+    let mut tool_names = std::collections::BTreeSet::<String>::new();
+
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            continue;
+        };
+
+        let mut filtered = Vec::<Value>::with_capacity(tcs.len());
+        for tc in tcs.iter() {
+            let is_func = tc.get("type").and_then(Value::as_str) == Some("function");
+            if is_func {
+                let name = tc
+                    .get("function")
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+
+                let args_str_opt = tc
+                    .get("function")
+                    .and_then(|f| f.get("arguments"))
+                    .and_then(Value::as_str);
+
+                let name_ok = !name.is_empty();
+                let args_ok = args_str_opt.map(is_valid_json_object_str).unwrap_or(false);
+
+                if !args_ok {
+                    // пометим инструмент с битым JSON
+                    tool_names.insert(name);
+                }
+
+                if name_ok && args_ok {
+                    filtered.push(tc.clone());
+                } else {
+                    removed_any = true;
+                }
+            } else {
+                // не поддерживаемые типы tool_calls тоже выпиливаем
+                removed_any = true;
+            }
+        }
+
+        if filtered.is_empty() {
+            if let Some(obj) = msg.as_object_mut() {
+                obj.remove("tool_calls");
+            }
+        } else {
+            *tcs = filtered;
+        }
+    }
+
+    if removed_any {
+        let hint = if tool_names.is_empty() {
+            "Some previous tool_call arguments were invalid JSON."
+        } else {
+            "Previous tool_call arguments for the following tools were invalid JSON."
+        };
+
+        let list = if tool_names.is_empty() {
+            String::new()
+        } else {
+            format!(" Affected tools: {}.", tool_names.into_iter().collect::<Vec<_>>().join(", "))
+        };
+
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": format!(
+                "{hint}{list} Re-emit the same tool call(s) with a SINGLE valid JSON object in the `arguments` field. \
+                 Do not stream multiple top-level objects, no trailing commas, and no plain text."
+            )
+        }));
+    }
+
+    removed_any
+}
+
+
+fn validate_or_repair_args(args: &str) -> String {
+    if serde_json::from_str::<Value>(args).is_ok() {
+        return args.to_string();
+    }
+    repair_tool_arguments(args).unwrap_or_else(|| args.to_string())
+}
+
+fn preflight_repair_messages(messages: &mut [serde_json::Value]) -> bool {
+    use serde_json::Value;
+    let mut changed = false;
+
+    for msg in messages.iter_mut() {
+        // assistant с tool_calls
+        if msg.get("role").and_then(Value::as_str) == Some("assistant") {
+            if let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for tc in tcs {
+                    if tc.get("type").and_then(Value::as_str) == Some("function") {
+                        if let Some(function) = tc.get_mut("function") {
+                            if let Some(args) = function.get_mut("arguments") {
+                                if let Some(raw) = args.as_str() {
+                                    if serde_json::from_str::<Value>(raw).is_err() {
+                                        if let Some(fixed) = repair_tool_arguments(raw) {
+                                            *args = Value::String(fixed);
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    changed
 }
 
 /// Lightweight SSE processor for the Chat Completions streaming format. The
@@ -529,9 +744,9 @@ async fn process_chat_sse<S>(
                     }
                 } else if let Some(obj) = message_reasoning.as_object()
                     && let Some(s) = obj
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| obj.get("content").and_then(|v| v.as_str()))
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| obj.get("content").and_then(|v| v.as_str()))
                     && !s.is_empty()
                 {
                     reasoning_text.push_str(s);
@@ -548,7 +763,10 @@ async fn process_chat_sse<S>(
                 .and_then(|tc| tc.as_array())
             {
                 for tc in tool_calls_delta {
-                    let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let idx = tc
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0) as usize;
                     ensure_tc_len(&mut tool_calls, idx);
                     let st = &mut tool_calls[idx];
                     st.active = true;
@@ -561,7 +779,8 @@ async fn process_chat_sse<S>(
                         if let Some(name) = function.get("name").and_then(|n| n.as_str()) {
                             st.name.get_or_insert_with(|| name.to_string());
                         }
-                        if let Some(args_fragment) = function.get("arguments").and_then(|a| a.as_str())
+                        if let Some(args_fragment) =
+                            function.get("arguments").and_then(|a| a.as_str())
                         {
                             st.arguments.push_str(args_fragment);
                         }
@@ -632,12 +851,15 @@ async fn process_chat_sse<S>(
                         // Эмитим все собранные tool calls в порядке индексов
                         for st in tool_calls.iter().filter(|s| s.active) {
                             let name = st.name.clone().unwrap_or_default();
-                            let args = st.arguments.clone();
+                            let mut args = st.arguments.clone();
 
-                            // (Опционально) можно логировать невалидный JSON,
-                            // но не правим его - пусть выше по пайплайну решают.
-                            if let Err(e) = serde_json::from_str::<serde_json::Value>(&args) {
-                                tracing::debug!("tool_call arguments not valid JSON yet: {e}; raw kept");
+                            if serde_json::from_str::<serde_json::Value>(&args).is_err() {
+                                if let Some(fixed) = repair_tool_arguments(&args) {
+                                    warn!("repaired invalid tool_call arguments for {name}");
+                                    args = fixed;
+                                } else {
+                                    debug!("tool_call arguments still not valid JSON; keeping raw");
+                                }
                             }
 
                             let item = ResponseItem::FunctionCall {
@@ -670,10 +892,20 @@ async fn process_chat_sse<S>(
                             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         }
 
+                        let mut args = legacy_fn.arguments;
+                        if serde_json::from_str::<serde_json::Value>(&args).is_err() {
+                            if let Some(fixed) = repair_tool_arguments(&args) {
+                                warn!("repaired invalid legacy function_call arguments for {}", legacy_fn.name.as_deref().unwrap_or("<unknown>"));
+                                args = fixed;
+                            } else {
+                                debug!("legacy function_call arguments still not valid JSON; keeping raw");
+                            }
+                        }
+
                         let item = ResponseItem::FunctionCall {
                             id: None,
                             name: legacy_fn.name.unwrap_or_default(),
-                            arguments: legacy_fn.arguments,
+                            arguments: args,
                             call_id: legacy_fn.call_id.unwrap_or_default(),
                         };
                         let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
@@ -784,13 +1016,15 @@ where
                             AggregateMode::AggregatedOnly => {
                                 if this.cumulative.is_empty()
                                     && let codex_protocol::models::ResponseItem::Message {
-                                    content,
-                                    ..
-                                } = &item
+                                        content,
+                                        ..
+                                    } = &item
                                     && let Some(text) = content.iter().find_map(|c| match c {
-                                    codex_protocol::models::ContentItem::OutputText { text } => Some(text),
-                                    _ => None,
-                                })
+                                        codex_protocol::models::ContentItem::OutputText {
+                                            text,
+                                        } => Some(text),
+                                        _ => None,
+                                    })
                                 {
                                     this.cumulative.push_str(text);
                                 }
@@ -798,7 +1032,9 @@ where
                             }
                             AggregateMode::Streaming => {
                                 if this.cumulative.is_empty() {
-                                    return Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(item))));
+                                    return Poll::Ready(Some(Ok(ResponseEvent::OutputItemDone(
+                                        item,
+                                    ))));
                                 } else {
                                     continue;
                                 }
@@ -812,9 +1048,9 @@ where
                     return Poll::Ready(Some(Ok(ResponseEvent::RateLimits(snapshot))));
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::Completed {
-                                        response_id,
-                                        token_usage,
-                                    }))) => {
+                    response_id,
+                    token_usage,
+                }))) => {
                     let mut emitted_any = false;
 
                     if !this.cumulative_reasoning.is_empty()
