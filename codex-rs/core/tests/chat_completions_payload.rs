@@ -157,6 +157,15 @@ fn function_call() -> ResponseItem {
     }
 }
 
+fn invalid_function_call(name: &str) -> ResponseItem {
+    ResponseItem::FunctionCall {
+        id: None,
+        name: name.to_string(),
+        arguments: "\"not an object\"".to_string(),
+        call_id: format!("invalid-{name}"),
+    }
+}
+
 fn local_shell_call() -> ResponseItem {
     ResponseItem::LocalShellCall {
         id: Some("id1".to_string()),
@@ -357,4 +366,35 @@ async fn suppresses_duplicate_assistant_messages() {
         assistant_messages[0]["content"],
         Value::String("dup".into())
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deduplicates_invalid_tool_call_prompt() {
+    if network_disabled() {
+        println!(
+            "Skipping test because it cannot execute when network is disabled in a Codex sandbox."
+        );
+        return;
+    }
+
+    let body = run_request(vec![
+        user_message("hi"),
+        invalid_function_call("update_plan"),
+        invalid_function_call("update_plan"),
+    ])
+    .await;
+
+    let messages = messages_from(&body);
+    let repair_prompt_count = messages
+        .iter()
+        .filter(|msg| {
+            msg["role"] == "user"
+                && msg["content"]
+                    .as_str()
+                    .map(|text| text.contains("Tool call `update_plan` was omitted"))
+                    .unwrap_or(false)
+        })
+        .count();
+
+    assert_eq!(repair_prompt_count, 1, "expected a single repair prompt");
 }

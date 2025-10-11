@@ -62,10 +62,10 @@ pub(crate) fn repair_tool_arguments(arguments: &str) -> Option<String> {
     }
 
     // Пайплайн ремонтов
-    if let Some(fixed) = fix_unclosed_json_delimiters(s) {
-        if serde_json::from_str::<Value>(&fixed).is_ok() {
-            return Some(fixed);
-        }
+    if let Some(fixed) = fix_unclosed_json_delimiters(s)
+        && serde_json::from_str::<Value>(&fixed).is_ok()
+    {
+        return Some(fixed);
     }
 
     let no_trailing = fix_trailing_commas(s);
@@ -73,22 +73,22 @@ pub(crate) fn repair_tool_arguments(arguments: &str) -> Option<String> {
         return Some(no_trailing);
     }
 
-    if let Some(wrapped) = wrap_multiple_roots(s) {
-        if serde_json::from_str::<Value>(&wrapped).is_ok() {
-            return Some(wrapped);
-        }
+    if let Some(wrapped) = wrap_multiple_roots(s)
+        && serde_json::from_str::<Value>(&wrapped).is_ok()
+    {
+        return Some(wrapped);
     }
 
     // Комбинации
-    if let Some(fixed) = fix_unclosed_json_delimiters(&no_trailing) {
-        if serde_json::from_str::<Value>(&fixed).is_ok() {
-            return Some(fixed);
-        }
+    if let Some(fixed) = fix_unclosed_json_delimiters(&no_trailing)
+        && serde_json::from_str::<Value>(&fixed).is_ok()
+    {
+        return Some(fixed);
     }
-    if let Some(wrapped) = wrap_multiple_roots(&no_trailing) {
-        if serde_json::from_str::<Value>(&wrapped).is_ok() {
-            return Some(wrapped);
-        }
+    if let Some(wrapped) = wrap_multiple_roots(&no_trailing)
+        && serde_json::from_str::<Value>(&wrapped).is_ok()
+    {
+        return Some(wrapped);
     }
 
     None
@@ -116,8 +116,8 @@ fn fix_unclosed_json_delimiters(arguments: &str) -> Option<String> {
             }
             match ch {
                 '\\' => escaped = true,
-                '"'  => in_string = false,
-                _    => {}
+                '"' => in_string = false,
+                _ => {}
             }
         } else {
             match ch {
@@ -174,14 +174,17 @@ fn fix_trailing_commas(s: &str) -> String {
         }
 
         match ch {
-            '"' => { in_string = true; out.push(ch); }
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
             ',' => {
-                if let Some(next) = chars.get(i + 1) {
-                    if *next == '}' || *next == ']' {
-                        // пропускаем запятую
-                        i += 1;
-                        continue;
-                    }
+                if let Some(next) = chars.get(i + 1)
+                    && (*next == '}' || *next == ']')
+                {
+                    // пропускаем запятую
+                    i += 1;
+                    continue;
                 }
                 out.push(ch);
             }
@@ -213,7 +216,9 @@ fn wrap_multiple_roots(s: &str) -> Option<String> {
     let mut values = Vec::with_capacity(parts.len());
     for p in parts {
         let p_trim = p.trim();
-        if p_trim.is_empty() { continue; }
+        if p_trim.is_empty() {
+            continue;
+        }
         if let Ok(v) = serde_json::from_str::<Value>(p_trim) {
             values.push(v);
         } else {
@@ -363,11 +368,14 @@ mod tests {
         let args = "{\"plan\":\"p\"}, {\"step\":\"s1\"}, {\"step\":\"s2\"}";
         let wrapped = wrap_multiple_roots(args).expect("should wrap");
         let v: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
-        assert_eq!(v, json!([
-            {"plan":"p"},
-            {"step":"s1"},
-            {"step":"s2"}
-        ]));
+        assert_eq!(
+            v,
+            json!([
+                {"plan":"p"},
+                {"step":"s1"},
+                {"step":"s2"}
+            ])
+        );
     }
 
     #[test]
