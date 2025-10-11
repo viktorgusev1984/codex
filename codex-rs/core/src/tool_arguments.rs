@@ -18,6 +18,10 @@ pub(crate) fn parse_tool_arguments(
     // Пайплайн ремонтов (идём от дешёвого к дорогому)
     let mut candidates: Vec<String> = Vec::new();
 
+    if let Some(stripped) = strip_trailing_non_json_text(s) {
+        candidates.push(stripped);
+    }
+
     if let Some(fixed) = fix_unclosed_json_delimiters(s) {
         candidates.push(fixed);
     }
@@ -62,6 +66,13 @@ pub(crate) fn repair_tool_arguments(arguments: &str) -> Option<String> {
     }
 
     // Пайплайн ремонтов
+    if let Some(stripped) = strip_trailing_non_json_text(s) {
+        if serde_json::from_str::<Value>(&stripped).is_ok() {
+            warn!("repaired invalid tool arguments");
+            return Some(stripped);
+        }
+    }
+
     if let Some(fixed) = fix_unclosed_json_delimiters(s) {
         if serde_json::from_str::<Value>(&fixed).is_ok() {
             return Some(fixed);
@@ -116,8 +127,8 @@ fn fix_unclosed_json_delimiters(arguments: &str) -> Option<String> {
             }
             match ch {
                 '\\' => escaped = true,
-                '"'  => in_string = false,
-                _    => {}
+                '"' => in_string = false,
+                _ => {}
             }
         } else {
             match ch {
@@ -149,6 +160,26 @@ fn fix_unclosed_json_delimiters(arguments: &str) -> Option<String> {
     Some(result)
 }
 
+/// Обрезает произвольный текст после первого валидного JSON-значения.
+fn strip_trailing_non_json_text(s: &str) -> Option<String> {
+    use serde_json::Value;
+    use serde_json::de::Deserializer;
+
+    let mut iter = Deserializer::from_str(s).into_iter::<Value>();
+    let value = iter.next()?.ok()?;
+    let remaining = &s[iter.byte_offset()..];
+    if remaining.trim().is_empty() {
+        return None;
+    }
+
+    let trailing = remaining.trim_start();
+    if serde_json::from_str::<Value>(trailing).is_ok() {
+        return None;
+    }
+
+    serde_json::to_string(&value).ok()
+}
+
 /// Удаляет висячие запятые перед } и ] вне строк.
 fn fix_trailing_commas(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -174,7 +205,10 @@ fn fix_trailing_commas(s: &str) -> String {
         }
 
         match ch {
-            '"' => { in_string = true; out.push(ch); }
+            '"' => {
+                in_string = true;
+                out.push(ch);
+            }
             ',' => {
                 if let Some(next) = chars.get(i + 1) {
                     if *next == '}' || *next == ']' {
@@ -213,7 +247,9 @@ fn wrap_multiple_roots(s: &str) -> Option<String> {
     let mut values = Vec::with_capacity(parts.len());
     for p in parts {
         let p_trim = p.trim();
-        if p_trim.is_empty() { continue; }
+        if p_trim.is_empty() {
+            continue;
+        }
         if let Ok(v) = serde_json::from_str::<Value>(p_trim) {
             values.push(v);
         } else {
@@ -240,6 +276,14 @@ fn split_top_level_values(s: &str) -> Option<Vec<String>> {
     for i in 0..cs.len() {
         let ch = cs[i];
 
+        if !in_string && depth == 0 && i > 0 {
+            let prev = cs[i - 1];
+            if (prev == '}' || prev == ']') && (ch == '{' || ch == '[' || ch == '"') {
+                parts.push(cs[start..i].iter().collect());
+                start = i;
+            }
+        }
+
         if in_string {
             if escaped {
                 escaped = false;
@@ -260,16 +304,7 @@ fn split_top_level_values(s: &str) -> Option<Vec<String>> {
                 parts.push(cs[start..i].iter().collect());
                 start = i + 1;
             }
-            _ => {
-                // стык объектов без запятой: `}{` или `][` и т.п.
-                if depth == 0 && i > 0 {
-                    let prev = cs[i - 1];
-                    if (prev == '}' || prev == ']') && (ch == '{' || ch == '[' || ch == '"') {
-                        parts.push(cs[start..i].iter().collect());
-                        start = i;
-                    }
-                }
-            }
+            _ => {}
         }
     }
 
@@ -348,6 +383,19 @@ mod tests {
     }
 
     #[test]
+    fn repair_tool_arguments_strips_trailing_text() {
+        let args = "{\"plan\":[{\"step\":\"S\",\"status\":\"pending\"}]}\n  Хотите, чтобы я: 1";
+        let repaired = repair_tool_arguments(args).expect("should repair");
+        let value: serde_json::Value = serde_json::from_str(&repaired).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "plan": [{ "step": "S", "status": "pending" }]
+            })
+        );
+    }
+
+    #[test]
     fn fix_trailing_commas_is_removed() {
         let args = "{\"a\":1,}";
         let fixed = fix_trailing_commas(args);
@@ -363,11 +411,14 @@ mod tests {
         let args = "{\"plan\":\"p\"}, {\"step\":\"s1\"}, {\"step\":\"s2\"}";
         let wrapped = wrap_multiple_roots(args).expect("should wrap");
         let v: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
-        assert_eq!(v, json!([
-            {"plan":"p"},
-            {"step":"s1"},
-            {"step":"s2"}
-        ]));
+        assert_eq!(
+            v,
+            json!([
+                {"plan":"p"},
+                {"step":"s1"},
+                {"step":"s2"}
+            ])
+        );
     }
 
     #[test]
