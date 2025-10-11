@@ -2174,7 +2174,10 @@ async fn retry_tool_calls_with_repaired_arguments(
             continue;
         };
 
-        if !output.content.contains("failed to parse function arguments") {
+        if !output
+            .content
+            .contains("failed to parse function arguments")
+        {
             continue;
         }
 

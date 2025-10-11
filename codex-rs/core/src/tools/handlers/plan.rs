@@ -113,7 +113,126 @@ pub(crate) async fn handle_update_plan(
 }
 
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
-    serde_json::from_str::<UpdatePlanArgs>(arguments).map_err(|e| {
-        FunctionCallError::RespondToModel(format!("failed to parse function arguments: {e}"))
-    })
+    const EXAMPLE_PAYLOAD: &str = r#"{\"explanation\":\"Optional summary\",\"plan\":[{\"step\":\"Investigate the issue\",\"status\":\"in_progress\"},{\"step\":\"Report the findings\",\"status\":\"pending\"}]}"#;
+
+    fn invalid_args(message: String) -> FunctionCallError {
+        FunctionCallError::RespondToModel(format!(
+            "failed to parse function arguments: {message}. update_plan requires a JSON object with a `plan` array. Each `plan` entry must include a `step` string and a `status` of \"pending\", \"in_progress\", or \"completed\". Example arguments: {EXAMPLE_PAYLOAD}"
+        ))
+    }
+
+    let value = serde_json::from_str::<serde_json::Value>(arguments)
+        .map_err(|err| invalid_args(format!("invalid JSON: {err}")))?;
+
+    {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| invalid_args("expected a JSON object".to_string()))?;
+
+        for key in obj.keys() {
+            if key != "plan" && key != "explanation" {
+                return Err(invalid_args(format!(
+                    "unexpected property `{key}`; only `plan` and optional `explanation` are allowed"
+                )));
+            }
+        }
+
+        let plan_value = obj
+            .get("plan")
+            .ok_or_else(|| invalid_args("missing required `plan` property".to_string()))?;
+        let plan_items = plan_value
+            .as_array()
+            .ok_or_else(|| invalid_args("`plan` must be an array of objects".to_string()))?;
+
+        for (idx, item) in plan_items.iter().enumerate() {
+            let Some(item_obj) = item.as_object() else {
+                return Err(invalid_args(format!(
+                    "plan[{idx}] must be an object with `step` and `status` fields"
+                )));
+            };
+
+            match item_obj.get("step").and_then(|v| v.as_str()).map(str::trim) {
+                Some(step) if !step.is_empty() => {}
+                _ => {
+                    return Err(invalid_args(format!(
+                        "plan[{idx}] must include a non-empty `step` string"
+                    )));
+                }
+            }
+
+            let status_value =
+                item_obj
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        invalid_args(format!("plan[{idx}] must include a `status` value"))
+                    })?;
+            match status_value {
+                "pending" | "in_progress" | "completed" => {}
+                other => {
+                    return Err(invalid_args(format!(
+                        "plan[{idx}] has invalid `status` value `{other}`; use `pending`, `in_progress`, or `completed`"
+                    )));
+                }
+            }
+
+            for key in item_obj.keys() {
+                if key != "step" && key != "status" {
+                    return Err(invalid_args(format!(
+                        "plan[{idx}] has unexpected property `{key}`; only `step` and `status` are allowed"
+                    )));
+                }
+            }
+        }
+
+        if let Some(explanation) = obj.get("explanation")
+            && !explanation.is_string()
+            && !explanation.is_null()
+        {
+            return Err(invalid_args(
+                "`explanation` must be a string if provided".to_string(),
+            ));
+        }
+    }
+
+    serde_json::from_value(value)
+        .map_err(|err| invalid_args(format!("invalid plan payload: {err}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract_message(err: FunctionCallError) -> String {
+        match err {
+            FunctionCallError::RespondToModel(msg) => msg,
+            other => panic!("expected RespondToModel error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reports_missing_plan_property() {
+        let err = parse_update_plan_arguments("{\"explanation\":\"hi\"}")
+            .expect_err("expected missing plan to error");
+        let message = extract_message(err);
+        assert!(
+            message.contains("missing required `plan` property"),
+            "unexpected message: {message}"
+        );
+        assert!(
+            message.contains("Example arguments"),
+            "expected message to contain an example payload: {message}"
+        );
+    }
+
+    #[test]
+    fn reports_invalid_status_values() {
+        let payload = r#"{"plan":[{"step":"Investigate","status":"waiting"}]}"#;
+        let err = parse_update_plan_arguments(payload).expect_err("invalid status should fail");
+        let message = extract_message(err);
+        assert!(
+            message.contains("invalid `status` value `waiting`"),
+            "unexpected message: {message}"
+        );
+    }
 }

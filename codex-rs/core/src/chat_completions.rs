@@ -10,6 +10,7 @@ use crate::error::RetryLimitReachedError;
 use crate::error::UnexpectedResponseError;
 use crate::model_family::ModelFamily;
 use crate::openai_tools::create_tools_json_for_chat_completions_api;
+use crate::tool_arguments::repair_tool_arguments;
 use crate::util::backoff;
 use bytes::Bytes;
 use codex_otel::otel_event_manager::OtelEventManager;
@@ -21,6 +22,7 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use reqwest::StatusCode;
+use serde_json::Value;
 use serde_json::json;
 use std::pin::Pin;
 use std::task::Context;
@@ -30,8 +32,6 @@ use tokio::time::timeout;
 use tracing::debug;
 use tracing::trace;
 use tracing::warn;
-use crate::tool_arguments::repair_tool_arguments;
-use serde_json::Value;
 
 /// Implementation for the classic Chat Completions API.
 pub(crate) async fn stream_chat_completions(
@@ -196,17 +196,17 @@ pub(crate) async fn stream_chat_completions(
                 // Добавляем tool_call ТОЛЬКО если arguments — валидный JSON-объект.
                 if is_valid_json_object_str(arguments) {
                     let mut msg = json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": arguments,
-                }
-            }]
-        });
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                        }]
+                    });
                     if let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
                         && let Some(obj) = msg.as_object_mut()
                     {
@@ -215,14 +215,11 @@ pub(crate) async fn stream_chat_completions(
                     messages.push(msg);
                 } else {
                     // Не пускаем битый tool_call в payload — пометим и потом добавим user-инструкцию.
-                    messages.push(json!({
-            "role": "user",
-            "content": format!(
-                "Tool call `{}` was omitted because `arguments` was not a single valid JSON object. \
-                 Please re-emit the call with a valid JSON object only.",
-                name
-            )
-        }));
+                    let content = format!(
+                        "Tool call `{name}` was omitted because `arguments` was not a single valid JSON object. \
+                 Please re-emit the call with a valid JSON object only."
+                    );
+                    push_user_message_if_absent(&mut messages, content);
                 }
             }
 
@@ -317,18 +314,17 @@ pub(crate) async fn stream_chat_completions(
         let _ = strip_broken_tool_calls_and_add_repair_prompt(&mut messages);
 
         let payload = json!({
-    "model": model_family.slug,
-    "messages": messages,
-    "stream": true,
-    "tools": tools_json,
-});
+            "model": model_family.slug,
+            "messages": messages,
+            "stream": true,
+            "tools": tools_json,
+        });
 
         debug!(
-    "POST to {}: {}",
-    provider.get_full_url(&None),
-    serde_json::to_string_pretty(&payload).unwrap_or_default()
-);
-
+            "POST to {}: {}",
+            provider.get_full_url(&None),
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
 
         let req_builder = provider.create_request_builder(client, &None).await?;
 
@@ -362,7 +358,9 @@ pub(crate) async fn stream_chat_completions(
                 if status == StatusCode::BAD_REQUEST && body.contains("Extra data") {
                     // Не чиним сами — удаляем битые tool_calls и объясняем, что нужно переиздать
                     if strip_broken_tool_calls_and_add_repair_prompt(&mut messages) {
-                        warn!("HTTP 400 'Extra data': stripped broken tool_calls and requested a re-emit; retrying once");
+                        warn!(
+                            "HTTP 400 'Extra data': stripped broken tool_calls and requested a re-emit; retrying once"
+                        );
 
                         let req_builder = provider.create_request_builder(client, &None).await?;
                         let retry_resp = otel_event_manager
@@ -370,27 +368,27 @@ pub(crate) async fn stream_chat_completions(
                                 req_builder
                                     .header(reqwest::header::ACCEPT, "text/event-stream")
                                     .json(&serde_json::json!({
-                        "model": model_family.slug,
-                        "messages": messages,
-                        "stream": true,
-                        "tools": tools_json,
-                    }))
+                                        "model": model_family.slug,
+                                        "messages": messages,
+                                        "stream": true,
+                                        "tools": tools_json,
+                                    }))
                                     .send()
                             })
                             .await;
 
-                        if let Ok(retry_ok) = retry_resp {
-                            if retry_ok.status().is_success() {
-                                let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
-                                let stream = retry_ok.bytes_stream().map_err(CodexErr::Reqwest);
-                                tokio::spawn(process_chat_sse(
-                                    stream,
-                                    tx_event,
-                                    provider.stream_idle_timeout(),
-                                    otel_event_manager.clone(),
-                                ));
-                                return Ok(ResponseStream { rx_event });
-                            }
+                        if let Ok(retry_ok) = retry_resp
+                            && retry_ok.status().is_success()
+                        {
+                            let (tx_event, rx_event) = mpsc::channel::<Result<ResponseEvent>>(1600);
+                            let stream = retry_ok.bytes_stream().map_err(CodexErr::Reqwest);
+                            tokio::spawn(process_chat_sse(
+                                stream,
+                                tx_event,
+                                provider.stream_idle_timeout(),
+                                otel_event_manager.clone(),
+                            ));
+                            return Ok(ResponseStream { rx_event });
                         }
                     }
 
@@ -401,7 +399,6 @@ pub(crate) async fn stream_chat_completions(
                         request_id: None,
                     }));
                 }
-
 
                 if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
                     return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
@@ -440,10 +437,10 @@ pub(crate) async fn stream_chat_completions(
 }
 
 fn is_valid_json_object_str(s: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(s) {
-        Ok(serde_json::Value::Object(_)) => true,
-        _ => false,
-    }
+    matches!(
+        serde_json::from_str::<serde_json::Value>(s),
+        Ok(serde_json::Value::Object(_))
+    )
 }
 
 fn json_kind(v: &serde_json::Value) -> &'static str {
@@ -476,9 +473,6 @@ fn validate_single_json_object_str(s: &str) -> std::result::Result<(), String> {
     }
 }
 
-
-
-
 /// Удаляет из assistant-сообщений все tool_calls с битым JSON в `arguments`
 /// и добавляет в конец `messages` user-подсказку с расшифровкой проблем.
 /// Возвращает true, если что-то удалили.
@@ -487,7 +481,8 @@ fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::
     let mut removed_any = false;
 
     // для сводки по каждому инструменту
-    let mut problems: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+    let mut problems: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
 
     for msg in messages.iter_mut() {
         if msg.get("role").and_then(Value::as_str) != Some("assistant") {
@@ -544,7 +539,11 @@ fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::
                     let snippet = args_str_opt
                         .map(|s| {
                             let s = s.trim();
-                            let s = if s.len() > 160 { format!("{}…", &s[..160]) } else { s.to_string() };
+                            let s = if s.len() > 160 {
+                                format!("{}…", &s[..160])
+                            } else {
+                                s.to_string()
+                            };
                             format!("args snippet: `{}`", s.replace('`', "'"))
                         })
                         .unwrap_or_else(|| "args snippet: <none>".to_string());
@@ -553,7 +552,12 @@ fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::
                     notes.push(snippet);
                 }
 
-                problems.entry(if name.is_empty() { "<unknown>".into() } else { name })
+                problems
+                    .entry(if name.is_empty() {
+                        "<unknown>".into()
+                    } else {
+                        name
+                    })
                     .or_default()
                     .extend(notes);
             }
@@ -576,21 +580,36 @@ fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::
         lines.push("Details:".into());
 
         for (tool, notes) in problems {
-            lines.push(format!("- `{}`:", tool));
+            lines.push(format!("- `{tool}`:"));
             for n in notes {
-                lines.push(format!("  • {}", n));
+                lines.push(format!("  • {n}"));
             }
         }
 
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": lines.join("\n"),
-        }));
+        let content = lines.join("\n");
+        push_user_message_if_absent(messages, content);
     }
 
     removed_any
 }
 
+fn push_user_message_if_absent(messages: &mut Vec<Value>, content: String) {
+    if user_message_exists(messages, &content) {
+        return;
+    }
+
+    messages.push(json!({
+        "role": "user",
+        "content": content,
+    }));
+}
+
+fn user_message_exists(messages: &[Value], content: &str) -> bool {
+    messages.iter().any(|msg| {
+        msg.get("role").and_then(Value::as_str) == Some("user")
+            && msg.get("content").and_then(Value::as_str) == Some(content)
+    })
+}
 
 /// Lightweight SSE processor for the Chat Completions streaming format. The
 /// output is mapped onto Codex's internal [`ResponseEvent`] so that the rest
@@ -914,10 +933,15 @@ async fn process_chat_sse<S>(
                         let mut args = legacy_fn.arguments;
                         if serde_json::from_str::<serde_json::Value>(&args).is_err() {
                             if let Some(fixed) = repair_tool_arguments(&args) {
-                                warn!("repaired invalid legacy function_call arguments for {}", legacy_fn.name.as_deref().unwrap_or("<unknown>"));
+                                warn!(
+                                    "repaired invalid legacy function_call arguments for {}",
+                                    legacy_fn.name.as_deref().unwrap_or("<unknown>")
+                                );
                                 args = fixed;
                             } else {
-                                debug!("legacy function_call arguments still not valid JSON; keeping raw");
+                                debug!(
+                                    "legacy function_call arguments still not valid JSON; keeping raw"
+                                );
                             }
                         }
 
