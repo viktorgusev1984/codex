@@ -17,6 +17,8 @@ use std::sync::LazyLock;
 
 pub struct PlanHandler;
 
+const ARGUMENT_PREVIEW_LIMIT: usize = 512;
+
 pub static PLAN_TOOL: LazyLock<ToolSpec> = LazyLock::new(|| {
     let mut plan_item_props = BTreeMap::new();
     plan_item_props.insert("step".to_string(), JsonSchema::String { description: None });
@@ -114,12 +116,13 @@ pub(crate) async fn handle_update_plan(
 
 fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, FunctionCallError> {
     const EXAMPLE_PAYLOAD: &str = r#"{\"explanation\":\"Optional summary\",\"plan\":[{\"step\":\"Investigate the issue\",\"status\":\"in_progress\"},{\"step\":\"Report the findings\",\"status\":\"pending\"}]}"#;
+    let received_arguments = summarize_arguments(arguments);
 
-    fn invalid_args(message: String) -> FunctionCallError {
+    let invalid_args = |message: String| {
         FunctionCallError::RespondToModel(format!(
-            "failed to parse function arguments: {message}. update_plan requires a JSON object with a `plan` array. Each `plan` entry must include a `step` string and a `status` of \"pending\", \"in_progress\", or \"completed\". Example arguments: {EXAMPLE_PAYLOAD}"
+            "failed to parse function arguments: {message}. update_plan requires a JSON object with a `plan` array. Each `plan` entry must include a `step` string and a `status` of \"pending\", \"in_progress\", or \"completed\". Example arguments: {EXAMPLE_PAYLOAD}. Received arguments: {received_arguments}"
         ))
-    }
+    };
 
     let value = serde_json::from_str::<serde_json::Value>(arguments)
         .map_err(|err| invalid_args(format!("invalid JSON: {err}")))?;
@@ -199,9 +202,32 @@ fn parse_update_plan_arguments(arguments: &str) -> Result<UpdatePlanArgs, Functi
         .map_err(|err| invalid_args(format!("invalid plan payload: {err}")))
 }
 
+fn summarize_arguments(arguments: &str) -> String {
+    let mut preview = String::new();
+    let mut chars = arguments.chars();
+    for _ in 0..ARGUMENT_PREVIEW_LIMIT {
+        match chars.next() {
+            Some(ch) => preview.push(ch),
+            None => break,
+        }
+    }
+    let truncated = chars.next().is_some();
+    let escaped_preview: String = preview.chars().flat_map(char::escape_default).collect();
+    if truncated {
+        format!("{escaped_preview}... (truncated to {ARGUMENT_PREVIEW_LIMIT} characters)")
+    } else {
+        escaped_preview
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
+
+    fn parse_error(arguments: &str) -> FunctionCallError {
+        parse_update_plan_arguments(arguments).expect_err("expected parse failure")
+    }
 
     fn extract_message(err: FunctionCallError) -> String {
         match err {
@@ -210,11 +236,54 @@ mod tests {
         }
     }
 
+    fn expect_message(arguments: &str) -> String {
+        extract_message(parse_error(arguments))
+    }
+
+    #[test]
+    fn error_message_includes_received_arguments() {
+        let arguments = "{\"explanation\":\"Missing plan data\"}";
+        let message = expect_message(arguments);
+        assert!(
+            message.contains("Received arguments: {"),
+            "missing received arguments in message: {message}"
+        );
+        assert!(
+            message.contains("Missing plan data"),
+            "missing original argument details in message: {message}"
+        );
+    }
+
+    #[test]
+    fn error_message_truncates_long_arguments() {
+        let long_value = "x".repeat(ARGUMENT_PREVIEW_LIMIT + 50);
+        let arguments = format!("{{\"plan\":\"{long_value}\"}}");
+        let message = expect_message(&arguments);
+        assert!(
+            message.contains("truncated to"),
+            "expected truncation note in message: {message}"
+        );
+        let expected_prefix: String = arguments
+            .chars()
+            .take(ARGUMENT_PREVIEW_LIMIT)
+            .flat_map(char::escape_default)
+            .collect();
+        assert!(
+            message.contains(&expected_prefix),
+            "missing escaped preview of arguments. expected prefix: {expected_prefix}, message: {message}"
+        );
+    }
+
+    #[test]
+    fn summarize_arguments_matches_non_truncated_values() {
+        let arguments = "short";
+        let summary = summarize_arguments(arguments);
+        assert_eq!(summary, "short");
+    }
+
     #[test]
     fn reports_missing_plan_property() {
-        let err = parse_update_plan_arguments("{\"explanation\":\"hi\"}")
-            .expect_err("expected missing plan to error");
-        let message = extract_message(err);
+        let message = expect_message("{\"explanation\":\"hi\"}");
         assert!(
             message.contains("missing required `plan` property"),
             "unexpected message: {message}"
@@ -228,8 +297,7 @@ mod tests {
     #[test]
     fn reports_invalid_status_values() {
         let payload = r#"{"plan":[{"step":"Investigate","status":"waiting"}]}"#;
-        let err = parse_update_plan_arguments(payload).expect_err("invalid status should fail");
-        let message = extract_message(err);
+        let message = expect_message(payload);
         assert!(
             message.contains("invalid `status` value `waiting`"),
             "unexpected message: {message}"
