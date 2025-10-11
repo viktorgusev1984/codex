@@ -1,6 +1,23 @@
+use std::collections::HashSet;
+use std::pin::Pin;
+use std::task::Context;
+use std::task::Poll;
 use std::time::Duration;
 
-use crate::ModelProviderInfo;
+use bytes::Bytes;
+use eventsource_stream::Eventsource;
+use futures::Stream;
+use futures::StreamExt;
+use futures::TryStreamExt;
+use reqwest::StatusCode;
+use serde_json::json;
+use serde_json::Value;
+use tokio::sync::mpsc;
+use tokio::time::timeout;
+use tracing::debug;
+use tracing::trace;
+use tracing::warn;
+
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
@@ -10,28 +27,58 @@ use crate::error::RetryLimitReachedError;
 use crate::error::UnexpectedResponseError;
 use crate::model_family::ModelFamily;
 use crate::openai_tools::create_tools_json_for_chat_completions_api;
+use crate::tool_arguments::repair_tool_arguments;
 use crate::util::backoff;
-use bytes::Bytes;
+use crate::ModelProviderInfo;
 use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::models::ContentItem;
 use codex_protocol::models::ReasoningItemContent;
 use codex_protocol::models::ResponseItem;
-use eventsource_stream::Eventsource;
-use futures::Stream;
-use futures::StreamExt;
-use futures::TryStreamExt;
-use reqwest::StatusCode;
-use serde_json::json;
-use std::pin::Pin;
-use std::task::Context;
-use std::task::Poll;
-use tokio::sync::mpsc;
-use tokio::time::timeout;
-use tracing::debug;
-use tracing::trace;
-use tracing::warn;
-use crate::tool_arguments::repair_tool_arguments;
-use serde_json::Value;
+
+fn canonicalize_args(raw: &str) -> String {
+    // сначала пытаемся починить аргументы
+    let fixed = repair_tool_arguments(raw).unwrap_or_else(|| raw.to_string());
+    // затем пробуем распарсить и сериализовать обратно, чтобы нормализовать порядок ключей
+    if let Ok(v) = serde_json::from_str::<Value>(&fixed) {
+        serde_json::to_string(&v).unwrap_or(fixed)
+    } else {
+        fixed
+    }
+}
+
+/// Попытаться «отремонтировать» arguments для конкретного инструмента и гарантировать,
+/// что на выходе — РОВНО один JSON-объект.
+fn try_fix_arguments(name: &str, raw: &str) -> std::result::Result<String, String> {
+    use serde_json::Value;
+
+    // 0) как есть
+    let mut s = raw.to_string();
+
+    // 1) универсальный ремонт (склейки, запятые и т.п.)
+    if serde_json::from_str::<Value>(&s).is_err() {
+        if let Some(fixed) = repair_tool_arguments(&s) {
+            s = fixed;
+        }
+    }
+
+    // 2) спец-обработка по имени инструмента
+    match name {
+        "update_plan" => {
+            // приводим к ожидаемому объекту + нормализуем `plan`
+            s = fix_update_plan_args(&s).map_err(|e| format!("update_plan: {e}"))?;
+        }
+        "shell" => {
+            if let Some(fixed) = fix_shell_args(&s) {
+                s = fixed;
+            }
+        }
+        _ => {}
+    }
+
+    // 3) финальная проверка — ровно один объект
+    validate_single_json_object_str(&s).map_err(|e| format!("arguments invalid: {e}"))?;
+    Ok(s)
+}
 
 /// Implementation for the classic Chat Completions API.
 pub(crate) async fn stream_chat_completions(
@@ -56,10 +103,6 @@ pub(crate) async fn stream_chat_completions(
     let input = prompt.get_formatted_input();
 
     // Pre-scan: map Reasoning blocks to the adjacent assistant anchor after the last user.
-    // - If the last emitted message is a user message, drop all reasoning.
-    // - Otherwise, for each Reasoning item after the last user message, attach it
-    //   to the immediate previous assistant message (stop turns) or the immediate
-    //   next assistant anchor (tool-call turns: function/local shell call, or assistant message).
     let mut reasoning_by_anchor_index: std::collections::HashMap<usize, String> =
         std::collections::HashMap::new();
 
@@ -92,7 +135,6 @@ pub(crate) async fn stream_chat_completions(
     // Attach reasoning only if the conversation does not end with a user message.
     if !matches!(last_emitted_role, Some("user")) {
         for (idx, item) in input.iter().enumerate() {
-            // Only consider reasoning that appears after the last user message.
             if let Some(u_idx) = last_user_index
                 && idx <= u_idx
             {
@@ -115,7 +157,7 @@ pub(crate) async fn stream_chat_completions(
                     continue;
                 }
 
-                // Prefer immediate previous assistant message (stop turns)
+                // Prefer immediate previous assistant message
                 let mut attached = false;
                 if idx > 0
                     && let ResponseItem::Message { role, .. } = &input[idx - 1]
@@ -128,7 +170,7 @@ pub(crate) async fn stream_chat_completions(
                     attached = true;
                 }
 
-                // Otherwise, attach to immediate next assistant anchor (tool-calls or assistant message)
+                // Otherwise, attach to immediate next assistant anchor
                 if !attached && idx + 1 < input.len() {
                     match &input[idx + 1] {
                         ResponseItem::FunctionCall { .. } | ResponseItem::LocalShellCall { .. } => {
@@ -151,8 +193,6 @@ pub(crate) async fn stream_chat_completions(
     }
 
     // Track last assistant text we emitted to avoid duplicate assistant messages
-    // in the outbound Chat Completions payload (can happen if a final
-    // aggregated assistant message was recorded alongside an earlier partial).
     let mut last_assistant_text: Option<String> = None;
 
     for (idx, item) in input.iter().enumerate() {
@@ -168,7 +208,6 @@ pub(crate) async fn stream_chat_completions(
                         _ => {}
                     }
                 }
-                // Skip exact-duplicate assistant messages.
                 if role == "assistant" {
                     if let Some(prev) = &last_assistant_text
                         && prev == &text
@@ -193,20 +232,26 @@ pub(crate) async fn stream_chat_completions(
                 call_id,
                 ..
             } => {
-                // Добавляем tool_call ТОЛЬКО если arguments — валидный JSON-объект.
-                if is_valid_json_object_str(arguments) {
-                    let mut msg = json!({
-            "role": "assistant",
-            "content": null,
-            "tool_calls": [{
-                "id": call_id,
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "arguments": arguments,
+                let mut args = arguments.clone();
+                if name == "update_plan" {
+                    if let Ok(new_args) = fix_update_plan_args(&args) {
+                        args = new_args;
+                    }
                 }
-            }]
-        });
+                // Добавляем tool_call ТОЛЬКО если arguments — валидный JSON-объект.
+                if is_valid_json_object_str(&args) {
+                    let mut msg = json!({
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": args,
+                            }
+                        }]
+                    });
                     if let Some(reasoning) = reasoning_by_anchor_index.get(&idx)
                         && let Some(obj) = msg.as_object_mut()
                     {
@@ -214,15 +259,14 @@ pub(crate) async fn stream_chat_completions(
                     }
                     messages.push(msg);
                 } else {
-                    // Не пускаем битый tool_call в payload — пометим и потом добавим user-инструкцию.
                     messages.push(json!({
-            "role": "user",
-            "content": format!(
-                "Tool call `{}` was omitted because `arguments` was not a single valid JSON object. \
-                 Please re-emit the call with a valid JSON object only.",
-                name
-            )
-        }));
+                        "role": "user",
+                        "content": format!(
+                            "Tool call `{}` was omitted because `arguments` was not a single valid JSON object. \
+                             Please re-emit the call with a valid JSON object only.",
+                            name
+                        )
+                    }));
                 }
             }
 
@@ -232,7 +276,6 @@ pub(crate) async fn stream_chat_completions(
                 status,
                 action,
             } => {
-                // Confirm with API team.
                 let mut msg = json!({
                     "role": "assistant",
                     "content": null,
@@ -287,48 +330,58 @@ pub(crate) async fn stream_chat_completions(
             ResponseItem::Reasoning { .. }
             | ResponseItem::WebSearchCall { .. }
             | ResponseItem::Other => {
-                // Omit these items from the conversation history.
                 continue;
             }
         }
     }
 
-    // let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
-    // let payload = json!({
-    //     "model": model_family.slug,
-    //     "messages": messages,
-    //     "stream": true,
-    //     "tools": tools_json,
-    // });
-    //
-    // debug!(
-    //     "POST to {}: {}",
-    //     provider.get_full_url(&None),
-    //     serde_json::to_string_pretty(&payload).unwrap_or_default()
-    // );
-
     let mut attempt = 0;
     let max_retries = provider.request_max_retries();
     loop {
         attempt += 1;
-        let tools_json = create_tools_json_for_chat_completions_api(&prompt.tools)?;
+        // Полный список tools из промпта
+        let tools_json_full = create_tools_json_for_chat_completions_api(&prompt.tools)?;
 
-        // финальная попытка починить tool_calls прямо в сообщениях
-        let _ = strip_broken_tool_calls_and_add_repair_prompt(&mut messages);
+        // Финальная попытка убрать битые tool_calls и добавить поясняющий prompt
+        let (removed_any, broken_tools) =
+            strip_broken_tool_calls_and_add_repair_prompt(&mut messages);
+
+        // если удаляли — оставим только нужные инструменты;
+        // если после фильтрации пусто — вернём полный список
+        let tools_json = if removed_any {
+            let filtered: Vec<Value> = tools_json_full
+                .iter()
+                .filter(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(|name| broken_tools.contains(name))
+                        .unwrap_or(false)
+                })
+                .cloned()
+                .collect();
+
+            if filtered.is_empty() {
+                Value::Array(tools_json_full.clone())
+            } else {
+                Value::Array(filtered)
+            }
+        } else {
+            Value::Array(tools_json_full.clone())
+        };
 
         let payload = json!({
-    "model": model_family.slug,
-    "messages": messages,
-    "stream": true,
-    "tools": tools_json,
-});
+            "model": model_family.slug,
+            "messages": messages,
+            "stream": true,
+            "tools": tools_json,
+        });
 
         debug!(
-    "POST to {}: {}",
-    provider.get_full_url(&None),
-    serde_json::to_string_pretty(&payload).unwrap_or_default()
-);
-
+            "POST to {}: {}",
+            provider.get_full_url(&None),
+            serde_json::to_string_pretty(&payload).unwrap_or_default()
+        );
 
         let req_builder = provider.create_request_builder(client, &None).await?;
 
@@ -358,10 +411,9 @@ pub(crate) async fn stream_chat_completions(
                 let headers = res.headers().clone();
                 let body = res.text().await.unwrap_or_default();
 
-                // Спец-кейс: 400 + "Extra data" (обычно из-за склеенных JSON-объектов в arguments)
+                // Спец-кейс: 400 + "Extra data"
                 if status == StatusCode::BAD_REQUEST && body.contains("Extra data") {
-                    // Не чиним сами — удаляем битые tool_calls и объясняем, что нужно переиздать
-                    if strip_broken_tool_calls_and_add_repair_prompt(&mut messages) {
+                    if strip_broken_tool_calls_and_add_repair_prompt(&mut messages).0 {
                         warn!("HTTP 400 'Extra data': stripped broken tool_calls and requested a re-emit; retrying once");
 
                         let req_builder = provider.create_request_builder(client, &None).await?;
@@ -370,11 +422,11 @@ pub(crate) async fn stream_chat_completions(
                                 req_builder
                                     .header(reqwest::header::ACCEPT, "text/event-stream")
                                     .json(&serde_json::json!({
-                        "model": model_family.slug,
-                        "messages": messages,
-                        "stream": true,
-                        "tools": tools_json,
-                    }))
+                                        "model": model_family.slug,
+                                        "messages": messages,
+                                        "stream": true,
+                                        "tools": tools_json,
+                                    }))
                                     .send()
                             })
                             .await;
@@ -394,14 +446,12 @@ pub(crate) async fn stream_chat_completions(
                         }
                     }
 
-                    // если не получилось почистить/повторить — вернуть как UnexpectedStatus
                     return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
                         status,
                         body,
                         request_id: None,
                     }));
                 }
-
 
                 if !(status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()) {
                     return Err(CodexErr::UnexpectedStatus(UnexpectedResponseError {
@@ -458,8 +508,95 @@ fn json_kind(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// Нормализует arguments для функции `shell`.
+/// Чиним паттерн `find ... -exec grep ... { ;` → `{}`; также упрощаем `.*FooId.*` → `FooId`.
+fn fix_shell_args(raw: &str) -> Option<String> {
+    use serde_json::{json, Value};
+
+    let mut v: Value = serde_json::from_str(raw).ok()?;
+    let obj = v.as_object_mut()?;
+
+    let cmd = obj.get_mut("command")?;
+    let arr = cmd.as_array_mut()?;
+
+    // заменим одиночный "{" на "{}" в контексте -exec
+    for i in 0..arr.len() {
+        if arr.get(i).and_then(Value::as_str) == Some("-exec") {
+            let mut j = i + 1;
+            while j < arr.len() {
+                if let Some(tok) = arr.get(j).and_then(Value::as_str) {
+                    if tok == ";" || tok == "+" {
+                        break;
+                    }
+                    if tok == "{" {
+                        arr[j] = Value::String("{}".to_string());
+                    }
+                }
+                j += 1;
+            }
+        }
+    }
+
+    // упрощаем regex-паттерны вида ".*FooId.*" → "FooId"
+    for i in 0..arr.len() {
+        if arr.get(i).and_then(Value::as_str) == Some("-l") {
+            if let Some(pat) = arr.get_mut(i + 1) {
+                if let Some(s) = pat.as_str() {
+                    if s.starts_with(".*") && s.ends_with(".*") && s.len() > 4 {
+                        let inner = &s[2..s.len() - 2];
+                        *pat = Value::String(inner.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    serde_json::to_string(&v).ok()
+}
+
+/// Нормализует arguments для `update_plan`.
+/// - `plan` обязателен; если строка — приводим к массиву с шагом.
+/// - `explanation` если присутствует — оставляем только строку.
+fn fix_update_plan_args(raw: &str) -> std::result::Result<String, String> {
+    use serde_json::{Map, Value};
+
+    let mut v: Value = serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
+    let obj: &mut Map<String, Value> =
+        v.as_object_mut().ok_or_else(|| "arguments must be a JSON object".to_string())?;
+
+    let plan_val = obj
+        .remove("plan")
+        .ok_or_else(|| "missing required field `plan`".to_string())?;
+
+    let normalized_plan = match plan_val {
+        Value::Array(a) => Value::Array(a),
+        Value::String(s) => {
+            let step = s.trim();
+            if step.is_empty() {
+                return Err("`plan` is empty string; expected non-empty step text".into());
+            }
+            json!([{"step": step, "status": "pending"}])
+        }
+        other => {
+            return Err(format!(
+                "`plan` must be an array (or string to coerce), got {}",
+                json_kind(&other)
+            ))
+        }
+    };
+
+    obj.insert("plan".into(), normalized_plan);
+
+    if let Some(expl) = obj.get("explanation") {
+        if !expl.is_string() {
+            obj.remove("explanation");
+        }
+    }
+
+    serde_json::to_string(&v).map_err(|e| e.to_string())
+}
+
 /// Возвращает Ok(()) если `s` — ровно один валидный JSON-объект без лишних токенов.
-/// В противном случае Err(<человекочитаемая причина>).
 fn validate_single_json_object_str(s: &str) -> std::result::Result<(), String> {
     match serde_json::from_str::<serde_json::Value>(s) {
         Ok(v) => {
@@ -476,29 +613,39 @@ fn validate_single_json_object_str(s: &str) -> std::result::Result<(), String> {
     }
 }
 
-
-
-
-/// Удаляет из assistant-сообщений все tool_calls с битым JSON в `arguments`
-/// и добавляет в конец `messages` user-подсказку с расшифровкой проблем.
-/// Возвращает true, если что-то удалили.
-fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::Value>) -> bool {
+/// Удаляет из assistant-сообщений tool_calls с битым JSON и добавляет repair-подсказку.
+fn strip_broken_tool_calls_and_add_repair_prompt(
+    messages: &mut Vec<serde_json::Value>,
+) -> (bool, std::collections::BTreeSet<String>) {
     use serde_json::Value;
+    use std::collections::{BTreeMap, BTreeSet};
+
     let mut removed_any = false;
+    let mut problems: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut broken_tools: BTreeSet<String> = BTreeSet::new();
 
-    // для сводки по каждому инструменту
-    let mut problems: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
-
-    for msg in messages.iter_mut() {
-        if msg.get("role").and_then(Value::as_str) != Some("assistant") {
+    let mut i = 0usize;
+    while i < messages.len() {
+        let role_ok = messages[i].get("role").and_then(Value::as_str) == Some("assistant");
+        if !role_ok {
+            i += 1;
             continue;
         }
-        let Some(tcs) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+
+        let Some(obj) = messages[i].as_object_mut() else {
+            i += 1;
             continue;
         };
 
-        let mut kept: Vec<Value> = Vec::with_capacity(tcs.len());
-        for tc in tcs.iter() {
+        let tcs_val = obj.remove("tool_calls");
+        let Some(tcs_arr) = tcs_val.and_then(|v| v.as_array().cloned()) else {
+            i += 1;
+            continue;
+        };
+
+        let mut kept: Vec<Value> = Vec::with_capacity(tcs_arr.len());
+
+        for mut tc in tcs_arr {
             let is_func = tc.get("type").and_then(Value::as_str) == Some("function");
             if !is_func {
                 removed_any = true;
@@ -517,62 +664,117 @@ fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::
                 .and_then(|f| f.get("arguments"))
                 .and_then(Value::as_str);
 
-            // имя инструмента должно быть
             let name_ok = !name.is_empty();
 
-            // args должны быть ровно одним JSON-объектом
-            let (args_ok, reason_opt) = match args_str_opt {
-                Some(s) => match validate_single_json_object_str(s) {
-                    Ok(()) => (true, None),
-                    Err(reason) => (false, Some(reason)),
-                },
-                None => (false, Some("missing `arguments` string".to_string())),
+            let (args_ok, reason_opt, maybe_fixed_args) = if let Some(s) = args_str_opt {
+                match serde_json::from_str::<Value>(s) {
+                    Ok(Value::Object(_)) => {
+                        if name == "update_plan" {
+                            match fix_update_plan_args(s) {
+                                Ok(fixed) => {
+                                    let fixed_opt = (fixed != s).then_some(fixed);
+                                    (true, None, fixed_opt)
+                                }
+                                Err(reason) => (false, Some(reason), None),
+                            }
+                        } else if name == "shell" {
+                            let fixed_opt = fix_shell_args(s);
+                            (true, None, fixed_opt)
+                        } else {
+                            (true, None, None)
+                        }
+                    }
+                    Ok(other) => (
+                        false,
+                        Some(format!("arguments must be object, got {}", json_kind(&other))),
+                        None,
+                    ),
+                    Err(e) => (false, Some(format!("invalid JSON: {e}")), None),
+                }
+            } else {
+                (false, Some("missing `arguments` string".to_string()), None)
             };
 
             if name_ok && args_ok {
-                kept.push(tc.clone());
+                if let Some(fixed) = maybe_fixed_args {
+                    if let Some(f) = tc.get_mut("function").and_then(Value::as_object_mut) {
+                        f.insert("arguments".into(), Value::String(fixed));
+                    }
+                }
+                kept.push(tc);
             } else {
                 removed_any = true;
+                broken_tools.insert(if name.is_empty() {
+                    "<unknown>".into()
+                } else {
+                    name.clone()
+                });
 
-                // Соберём подробности
                 let mut notes = Vec::<String>::new();
                 if !name_ok {
                     notes.push("missing function `name`".to_string());
                 }
                 if let Some(r) = reason_opt {
-                    // короткий сниппет аргументов для контекста
                     let snippet = args_str_opt
                         .map(|s| {
                             let s = s.trim();
-                            let s = if s.len() > 160 { format!("{}…", &s[..160]) } else { s.to_string() };
+                            let s = if s.len() > 160 {
+                                format!("{}…", &s[..160])
+                            } else {
+                                s.to_string()
+                            };
                             format!("args snippet: `{}`", s.replace('`', "'"))
                         })
                         .unwrap_or_else(|| "args snippet: <none>".to_string());
 
+                    if let Some(s) = args_str_opt {
+                        if let Ok(v) = serde_json::from_str::<Value>(s) {
+                            let kind = json_kind(&v);
+                            if kind != "object" {
+                                notes.push(format!("arguments must be object, got {}", kind));
+                                if let Value::Array(a) = &v {
+                                    notes.push(format!("array length: {}", a.len()));
+                                }
+                                if let Value::String(st) = &v {
+                                    notes.push(format!("string length: {}", st.len()));
+                                }
+                            }
+                        }
+                    }
+
                     notes.push(r);
                     notes.push(snippet);
                 }
-
-                problems.entry(if name.is_empty() { "<unknown>".into() } else { name })
+                problems
+                    .entry(if name.is_empty() { "<unknown>".into() } else { name })
                     .or_default()
                     .extend(notes);
             }
         }
 
-        if kept.is_empty() {
-            if let Some(obj) = msg.as_object_mut() {
-                obj.remove("tool_calls");
-            }
-        } else {
-            *tcs = kept;
+        if !kept.is_empty() {
+            obj.insert("tool_calls".to_string(), Value::Array(kept));
         }
+        i += 1;
     }
 
     if removed_any {
-        // Сформируем понятное пояснение для модели
         let mut lines = Vec::<String>::new();
-        lines.push("Some previous tool call(s) were omitted because `arguments` was not a SINGLE valid JSON object.".into());
-        lines.push("Please re-emit the SAME call(s) with exactly one JSON object in `arguments` (no arrays, no multiple top-level objects, no trailing commas, no plain text).".into());
+        lines.push(
+            "Some previous tool call(s) were omitted because `arguments` was not a SINGLE valid JSON object."
+                .into(),
+        );
+        lines.push(
+            "Please re-emit the SAME call(s) with exactly one JSON object in `arguments` (no arrays, no multiple top-level objects, no trailing commas, no plain text)."
+                .into(),
+        );
+        lines.push("Example for `update_plan`:".into());
+        lines.push("```json".into());
+        lines.push(
+            r#"{ "plan": [ { "step": "Analyze Scala project structure and main components", "status": "pending" } ], "explanation": "High-level outline" }"#
+                .into(),
+        );
+        lines.push("```".into());
         lines.push("Details:".into());
 
         for (tool, notes) in problems {
@@ -582,19 +784,28 @@ fn strip_broken_tool_calls_and_add_repair_prompt(messages: &mut Vec<serde_json::
             }
         }
 
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": lines.join("\n"),
-        }));
+        let already_has_repair = messages.iter().rev().take(8).any(|m| {
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
+                && m.get("content")
+                .and_then(|c| c.as_str())
+                .map_or(false, |s| {
+                    s.starts_with("Some previous tool call(s) were omitted")
+                })
+        });
+        if !already_has_repair {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": lines.join("\n"),
+            }));
+        }
+
+        tracing::warn!("Dropped tool_calls due to bad arguments: {:?}", broken_tools);
     }
 
-    removed_any
+    (removed_any, broken_tools)
 }
 
-
-/// Lightweight SSE processor for the Chat Completions streaming format. The
-/// output is mapped onto Codex's internal [`ResponseEvent`] so that the rest
-/// of the pipeline can stay agnostic of the underlying wire format.
+/// Lightweight SSE processor for the Chat Completions streaming format.
 async fn process_chat_sse<S>(
     stream: S,
     tx_event: mpsc::Sender<Result<ResponseEvent>>,
@@ -605,7 +816,9 @@ async fn process_chat_sse<S>(
 {
     let mut stream = stream.eventsource();
 
-    // Состояние для нового формата (несколько tool_calls по индексу)
+    let mut emitted_calls: HashSet<(String, String)> = HashSet::new();
+    let mut saw_indexed_tool_calls = false;
+
     #[derive(Default, Debug, Clone)]
     struct FunctionCallState {
         name: Option<String>,
@@ -641,7 +854,6 @@ async fn process_chat_sse<S>(
                 return;
             }
             Ok(None) => {
-                // Stream closed gracefully – emit Completed with dummy id.
                 let _ = tx_event
                     .send(Ok(ResponseEvent::Completed {
                         response_id: String::new(),
@@ -661,10 +873,7 @@ async fn process_chat_sse<S>(
             }
         };
 
-        // OpenAI Chat streaming sends a literal string "[DONE]" when finished.
         if sse.data.trim() == "[DONE]" {
-            // Emit any finalized items before closing so downstream consumers receive
-            // terminal events for both assistant content and raw reasoning.
             if !assistant_text.is_empty() {
                 let item = ResponseItem::Message {
                     role: "assistant".to_string(),
@@ -697,7 +906,6 @@ async fn process_chat_sse<S>(
             return;
         }
 
-        // Parse JSON chunk
         let chunk: serde_json::Value = match serde_json::from_str(&sse.data) {
             Ok(v) => v,
             Err(_) => continue,
@@ -707,7 +915,6 @@ async fn process_chat_sse<S>(
         let choice_opt = chunk.get("choices").and_then(|c| c.get(0));
 
         if let Some(choice) = choice_opt {
-            // Handle assistant content tokens as streaming deltas.
             if let Some(content) = choice
                 .get("delta")
                 .and_then(|d| d.get("content"))
@@ -720,7 +927,6 @@ async fn process_chat_sse<S>(
                     .await;
             }
 
-            // Forward any reasoning/thinking deltas if present.
             if let Some(reasoning_val) = choice.get("delta").and_then(|d| d.get("reasoning")) {
                 let mut maybe_text = reasoning_val
                     .as_str()
@@ -751,7 +957,6 @@ async fn process_chat_sse<S>(
                 }
             }
 
-            // Some providers only include reasoning on the final message object.
             if let Some(message_reasoning) = choice.get("message").and_then(|m| m.get("reasoning"))
             {
                 if let Some(s) = message_reasoning.as_str() {
@@ -763,9 +968,9 @@ async fn process_chat_sse<S>(
                     }
                 } else if let Some(obj) = message_reasoning.as_object()
                     && let Some(s) = obj
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| obj.get("content").and_then(|v| v.as_str()))
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| obj.get("content").and_then(|v| v.as_str()))
                     && !s.is_empty()
                 {
                     reasoning_text.push_str(s);
@@ -775,12 +980,13 @@ async fn process_chat_sse<S>(
                 }
             }
 
-            // --- Новый формат: delta.tool_calls[*] c index ---
+            // Новый формат: delta.tool_calls[*] c index
             if let Some(tool_calls_delta) = choice
                 .get("delta")
                 .and_then(|d| d.get("tool_calls"))
                 .and_then(|tc| tc.as_array())
             {
+                saw_indexed_tool_calls = true;
                 for tc in tool_calls_delta {
                     let idx = tc
                         .get("index")
@@ -807,7 +1013,7 @@ async fn process_chat_sse<S>(
                 }
             }
 
-            // --- Старый формат: delta.function_call ---
+            // Старый формат: delta.function_call
             if let Some(function_call) = choice
                 .get("delta")
                 .and_then(|d| d.get("function_call"))
@@ -825,7 +1031,7 @@ async fn process_chat_sse<S>(
                 }
             }
 
-            // --- Полный message.tool_calls без дельт (некоторые провайдеры) ---
+            // Полный message.tool_calls
             if let Some(full_tcs) = choice
                 .get("message")
                 .and_then(|m| m.get("tool_calls"))
@@ -850,11 +1056,22 @@ async fn process_chat_sse<S>(
                 }
             }
 
-            // --- Завершение тёрна ---
             if let Some(finish_reason) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                 match finish_reason {
                     "tool_calls" => {
-                        // Сначала финализируем reasoning
+                        // 1) флеш ассистентского текста
+                        if !assistant_text.is_empty() {
+                            let item = ResponseItem::Message {
+                                role: "assistant".to_string(),
+                                content: vec![ContentItem::OutputText {
+                                    text: std::mem::take(&mut assistant_text),
+                                }],
+                                id: None,
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+
+                        // 2) флеш reasoning
                         if !reasoning_text.is_empty() {
                             let item = ResponseItem::Reasoning {
                                 id: String::new(),
@@ -867,18 +1084,26 @@ async fn process_chat_sse<S>(
                             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         }
 
-                        // Эмитим все собранные tool calls в порядке индексов
+                        // 3) эмитим tool calls (строгая правка + дедуп)
+                        let mut any_invalid = false;
+                        let mut invalid_notes: Vec<String> = Vec::new();
+
                         for st in tool_calls.iter().filter(|s| s.active) {
                             let name = st.name.clone().unwrap_or_default();
-                            let mut args = st.arguments.clone();
+                            let raw_args = st.arguments.clone();
 
-                            if serde_json::from_str::<serde_json::Value>(&args).is_err() {
-                                if let Some(fixed) = repair_tool_arguments(&args) {
-                                    warn!("repaired invalid tool_call arguments for {name}");
-                                    args = fixed;
-                                } else {
-                                    debug!("tool_call arguments still not valid JSON; keeping raw");
+                            let args = match try_fix_arguments(&name, &raw_args) {
+                                Ok(fixed) => fixed,
+                                Err(reason) => {
+                                    any_invalid = true;
+                                    invalid_notes.push(format!("- `{}`: {}", name, reason));
+                                    continue;
                                 }
+                            };
+
+                            let key = (name.clone(), canonicalize_args(&args));
+                            if !emitted_calls.insert(key) {
+                                continue;
                             }
 
                             let item = ResponseItem::FunctionCall {
@@ -890,6 +1115,25 @@ async fn process_chat_sse<S>(
                             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         }
 
+                        // 4) если что-то пропустили — эмитим repair-подсказку как ассистент
+                        if any_invalid {
+                            let mut lines = Vec::<String>::new();
+                            lines.push("Some tool call(s) were omitted because `arguments` was not a SINGLE valid JSON object.".into());
+                            lines.push("Please re-emit the SAME call(s) with exactly one JSON object in `arguments` (no arrays, no multiple top-level objects, no trailing commas, no plain text).".into());
+                            lines.push("Details:".into());
+                            lines.extend(invalid_notes);
+                            lines.push("Example for `update_plan`:\n```json\n{ \"plan\": [ { \"step\": \"Compare TECM token caching…\", \"status\": \"pending\" } ] }\n```".into());
+
+                            let item = ResponseItem::Message {
+                                role: "assistant".to_string(),
+                                content: vec![ContentItem::OutputText { text: lines.join("\n") }],
+                                id: None,
+                            };
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::OutputItemDone(item)))
+                                .await;
+                        }
+
                         let _ = tx_event
                             .send(Ok(ResponseEvent::Completed {
                                 response_id: String::new(),
@@ -899,46 +1143,17 @@ async fn process_chat_sse<S>(
                         return;
                     }
                     "function_call" if legacy_fn.active => {
-                        if !reasoning_text.is_empty() {
-                            let item = ResponseItem::Reasoning {
-                                id: String::new(),
-                                summary: Vec::new(),
-                                content: Some(vec![ReasoningItemContent::ReasoningText {
-                                    text: std::mem::take(&mut reasoning_text),
-                                }]),
-                                encrypted_content: None,
-                            };
-                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        if saw_indexed_tool_calls {
+                            let _ = tx_event
+                                .send(Ok(ResponseEvent::Completed {
+                                    response_id: String::new(),
+                                    token_usage: None,
+                                }))
+                                .await;
+                            return;
                         }
 
-                        let mut args = legacy_fn.arguments;
-                        if serde_json::from_str::<serde_json::Value>(&args).is_err() {
-                            if let Some(fixed) = repair_tool_arguments(&args) {
-                                warn!("repaired invalid legacy function_call arguments for {}", legacy_fn.name.as_deref().unwrap_or("<unknown>"));
-                                args = fixed;
-                            } else {
-                                debug!("legacy function_call arguments still not valid JSON; keeping raw");
-                            }
-                        }
-
-                        let item = ResponseItem::FunctionCall {
-                            id: None,
-                            name: legacy_fn.name.unwrap_or_default(),
-                            arguments: args,
-                            call_id: legacy_fn.call_id.unwrap_or_default(),
-                        };
-                        let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-
-                        let _ = tx_event
-                            .send(Ok(ResponseEvent::Completed {
-                                response_id: String::new(),
-                                token_usage: None,
-                            }))
-                            .await;
-                        return;
-                    }
-                    "stop" => {
-                        // Обычная остановка — финализируем ассистентский текст и reasoning
+                        // флеш ассистента / reasoning
                         if !assistant_text.is_empty() {
                             let item = ResponseItem::Message {
                                 role: "assistant".to_string(),
@@ -961,6 +1176,96 @@ async fn process_chat_sse<S>(
                             let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                         }
 
+                        // строгая правка legacy-args
+                        let name = legacy_fn.name.take().unwrap_or_default();
+                        let raw_args = std::mem::take(&mut legacy_fn.arguments);
+
+                        let args = match try_fix_arguments(&name, &raw_args) {
+                            Ok(fixed) => fixed,
+                            Err(reason) => {
+                                let lines = vec![
+                                    "A previous tool call was omitted because `arguments` was not a SINGLE valid JSON object.".to_string(),
+                                    "Please re-emit the SAME call with exactly one JSON object in `arguments`.".to_string(),
+                                    format!("Details:\n- `{}`: {}", name, reason),
+                                    "Example for `update_plan`:\n```json\n{ \"plan\": [ { \"step\": \"Compare TECM token caching…\", \"status\": \"pending\" } ] }\n```".to_string(),
+                                ];
+                                let item = ResponseItem::Message {
+                                    role: "assistant".to_string(),
+                                    content: vec![ContentItem::OutputText { text: lines.join("\n") }],
+                                    id: None,
+                                };
+                                let _ = tx_event
+                                    .send(Ok(ResponseEvent::OutputItemDone(item)))
+                                    .await;
+
+                                let _ = tx_event
+                                    .send(Ok(ResponseEvent::Completed {
+                                        response_id: String::new(),
+                                        token_usage: None,
+                                    }))
+                                    .await;
+                                return;
+                            }
+                        };
+
+                        let key = (name.clone(), canonicalize_args(&args));
+                        if emitted_calls.insert(key) {
+                            let item = ResponseItem::FunctionCall {
+                                id: None,
+                                name,
+                                arguments: args,
+                                call_id: legacy_fn.call_id.unwrap_or_default(),
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+
+                        let _ = tx_event
+                            .send(Ok(ResponseEvent::Completed {
+                                response_id: String::new(),
+                                token_usage: None,
+                            }))
+                            .await;
+                        return;
+                    }
+                    "stop" => {
+                        let mut emitted = false;
+
+                        if !assistant_text.is_empty() {
+                            emitted = true;
+                            let item = ResponseItem::Message {
+                                role: "assistant".to_string(),
+                                content: vec![ContentItem::OutputText {
+                                    text: std::mem::take(&mut assistant_text),
+                                }],
+                                id: None,
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+                        if !reasoning_text.is_empty() {
+                            emitted = true;
+                            let item = ResponseItem::Reasoning {
+                                id: String::new(),
+                                summary: Vec::new(),
+                                content: Some(vec![ReasoningItemContent::ReasoningText {
+                                    text: std::mem::take(&mut reasoning_text),
+                                }]),
+                                encrypted_content: None,
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+
+                        if !emitted {
+                            let item = ResponseItem::Message {
+                                role: "assistant".to_string(),
+                                content: vec![ContentItem::OutputText {
+                                    text: "Previous tool call(s) were dropped because `arguments` was not a single valid JSON object. Re-emit the same call(s) with exactly one JSON object."
+                                        .to_string(),
+                                }],
+                                id: None,
+                            };
+                            let _ = tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                        }
+
                         let _ = tx_event
                             .send(Ok(ResponseEvent::Completed {
                                 response_id: String::new(),
@@ -977,21 +1282,6 @@ async fn process_chat_sse<S>(
 }
 
 /// Optional client-side aggregation helper
-///
-/// Stream adapter that merges the incremental `OutputItemDone` chunks coming from
-/// [`process_chat_sse`] into a *running* assistant message, **suppressing the
-/// per-token deltas**.  The stream stays silent while the model is thinking
-/// and only emits two events per turn:
-///
-///   1. `ResponseEvent::OutputItemDone` with the *complete* assistant message
-///      (fully concatenated).
-///   2. The original `ResponseEvent::Completed` right after it.
-///
-/// This mirrors the behaviour the TypeScript CLI exposes to its higher layers.
-///
-/// The adapter is intentionally *lossless*: callers who do **not** opt in via
-/// [`AggregateStreamExt::aggregate()`] keep receiving the original unmodified
-/// events.
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum AggregateMode {
     AggregatedOnly,
@@ -1014,7 +1304,6 @@ where
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
 
-        // First, flush any buffered events from the previous call.
         if let Some(ev) = this.pending.pop_front() {
             return Poll::Ready(Some(Ok(ev)));
         }
@@ -1035,15 +1324,15 @@ where
                             AggregateMode::AggregatedOnly => {
                                 if this.cumulative.is_empty()
                                     && let codex_protocol::models::ResponseItem::Message {
-                                        content,
-                                        ..
-                                    } = &item
+                                    content,
+                                    ..
+                                } = &item
                                     && let Some(text) = content.iter().find_map(|c| match c {
-                                        codex_protocol::models::ContentItem::OutputText {
-                                            text,
-                                        } => Some(text),
-                                        _ => None,
-                                    })
+                                    codex_protocol::models::ContentItem::OutputText {
+                                        text,
+                                    } => Some(text),
+                                    _ => None,
+                                })
                                 {
                                     this.cumulative.push_str(text);
                                 }
@@ -1067,9 +1356,9 @@ where
                     return Poll::Ready(Some(Ok(ResponseEvent::RateLimits(snapshot))));
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::Completed {
-                    response_id,
-                    token_usage,
-                }))) => {
+                                        response_id,
+                                        token_usage,
+                                    }))) => {
                     let mut emitted_any = false;
 
                     if !this.cumulative_reasoning.is_empty()
@@ -1133,7 +1422,9 @@ where
                 Poll::Ready(Some(Ok(ResponseEvent::ReasoningContentDelta(delta)))) => {
                     this.cumulative_reasoning.push_str(&delta);
                     if matches!(this.mode, AggregateMode::Streaming) {
-                        return Poll::Ready(Some(Ok(ResponseEvent::ReasoningContentDelta(delta))));
+                        return Poll::Ready(Some(Ok(ResponseEvent::ReasoningContentDelta(
+                            delta,
+                        ))));
                     } else {
                         continue;
                     }
