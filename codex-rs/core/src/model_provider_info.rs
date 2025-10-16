@@ -37,6 +37,8 @@ pub enum WireApi {
     /// Regular Chat Completions compatible with `/v1/chat/completions`.
     #[default]
     Chat,
+    /// The Sync Chat Completions compatible with `/v1/chat/completions`.
+    SyncChat,
 }
 
 /// Serializable representation of a provider definition.
@@ -159,6 +161,7 @@ impl ModelProviderInfo {
         match self.wire_api {
             WireApi::Responses => format!("{base_url}/responses{query_string}"),
             WireApi::Chat => format!("{base_url}/chat/completions{query_string}"),
+            WireApi::SyncChat => format!("{base_url}/chat/completions{query_string}"),
         }
     }
 

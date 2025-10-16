@@ -27,6 +27,7 @@ use tracing::warn;
 
 use crate::chat_completions::AggregateStreamExt;
 use crate::chat_completions::stream_chat_completions;
+use crate::sync_chat_completions::chat_completions_sync;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
@@ -134,6 +135,16 @@ impl ModelClient {
     ) -> Result<ResponseStream> {
         match self.provider.wire_api {
             WireApi::Responses => self.stream_responses(prompt, task_kind).await,
+            WireApi::SyncChat => {
+                chat_completions_sync(
+                    prompt,
+                    &self.config.model_family,
+                    &self.client,
+                    &self.provider,
+                    &self.otel_event_manager,
+                )
+                    .await
+            },
             WireApi::Chat => {
                 // Create the raw streaming connection first.
                 let response_stream = stream_chat_completions(

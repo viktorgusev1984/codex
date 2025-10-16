@@ -1051,6 +1051,7 @@ dependencies = [
  "escargot",
  "eventsource-stream",
  "futures",
+ "httpdate",
  "indexmap 2.10.0",
  "landlock",
  "libc",
