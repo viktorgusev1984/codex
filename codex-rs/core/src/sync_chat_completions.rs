@@ -4,6 +4,7 @@ use crate::ModelProviderInfo;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
+use crate::config_types::SyncChatCompletionsConfig;
 use crate::error::CodexErr;
 use crate::error::ConnectionFailedError;
 use crate::error::Result;
@@ -22,7 +23,8 @@ use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
 use serde_json::Value;
 use serde_json::json;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 use tracing::debug;
 use tracing::trace;
 use tracing::warn;
@@ -34,6 +36,7 @@ pub(crate) async fn chat_completions_sync(
     client: &reqwest::Client,
     provider: &ModelProviderInfo,
     otel_event_manager: &OtelEventManager,
+    sync_config: &SyncChatCompletionsConfig,
 ) -> Result<ResponseStream> {
     if prompt.output_schema.is_some() {
         return Err(CodexErr::UnsupportedOperation(
@@ -255,11 +258,16 @@ pub(crate) async fn chat_completions_sync(
         "messages": messages,
         "stream": false,
         "tools": tools_json,
-        "temperature": 0.6,
-        "top_p": 0.8,
-        "top_k":  20,
-        "min_p": 0
+        "temperature": sync_config.temperature,
+        "top_p": sync_config.top_p,
+        "min_p": sync_config.min_p,
     });
+
+    if let Some(top_k) = sync_config.top_k {
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("top_k".to_string(), json!(top_k));
+        }
+    }
 
     if let Some(format) = response_format.clone() {
         if let Some(obj) = payload.as_object_mut() {
@@ -474,7 +482,7 @@ pub(crate) async fn chat_completions_sync(
                             reasons_ref,     // &str
                             attempt,
                         )
-                            .await;
+                        .await;
 
                         match clean {
                             Ok(fixed_body) => {
@@ -1102,7 +1110,7 @@ fn build_simple_repair_feedback() -> String {
 {"name":"TOOL_NAME","arguments":{"key":"value"}}
 </tool_call>
 "#
-        .to_string()
+    .to_string()
 }
 
 /// Разбор нестримингового ответа и эмиссия ваших ResponseEvent’ов.
@@ -1789,8 +1797,8 @@ mod tests {
 
         let first = rx.recv().await.unwrap().unwrap();
         if let ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
-                                                 name, arguments, ..
-                                             }) = first
+            name, arguments, ..
+        }) = first
         {
             assert_eq!(name, "shell");
             assert_eq!(
@@ -1847,11 +1855,11 @@ mod tests {
         let first = rx.recv().await.expect("first event").expect("event ok");
         match first {
             ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
-                                              name,
-                                              arguments,
-                                              call_id,
-                                              ..
-                                          }) => {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
                 assert_eq!(name, "shell");
                 assert_eq!(call_id, "");
                 assert_eq!(
@@ -1903,11 +1911,11 @@ mod tests {
 
         match rx.recv().await.expect("first event").expect("event ok") {
             ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
-                                              name,
-                                              arguments,
-                                              call_id,
-                                              ..
-                                          }) => {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
                 assert_eq!(name, "shell");
                 assert_eq!(call_id, "call_42");
                 assert_eq!(
@@ -1950,11 +1958,11 @@ mod tests {
         let first = rx.recv().await.expect("first event").expect("event ok");
         match first {
             ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
-                                              name,
-                                              arguments,
-                                              call_id,
-                                              ..
-                                          }) => {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
                 assert_eq!(name, "shell");
                 assert_eq!(call_id, "call_123");
                 assert_eq!(arguments, "{\"command\":[\"bash\",\"-lc\"]}");

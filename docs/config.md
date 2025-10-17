@@ -142,6 +142,20 @@ model_provider = "ollama"
 model = "mistral"
 ```
 
+## sync_chat_completions
+
+Providers that use the synchronous Chat Completions API (`wire_api = "sync_chat"`) inherit a set of default sampling parameters. These can be overridden via the `[sync_chat_completions]` table:
+
+```toml
+[sync_chat_completions]
+temperature = 0.7
+top_p = 0.9
+top_k = 32
+min_p = 0.05
+```
+
+Any field you omit falls back to Codex defaults (`temperature = 0.6`, `top_p = 0.8`, `top_k = 20`, `min_p = 0.0`). Set `top_k` to the desired integer value; specify `top_k = 0` to remove the parameter from outgoing requests entirely.
+
 ## approval_policy
 
 Determines when the user should be prompted to approve whether Codex can execute a command:
