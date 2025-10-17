@@ -27,7 +27,6 @@ use tracing::warn;
 
 use crate::chat_completions::AggregateStreamExt;
 use crate::chat_completions::stream_chat_completions;
-use crate::sync_chat_completions::chat_completions_sync;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
@@ -49,6 +48,7 @@ use crate::protocol::RateLimitSnapshot;
 use crate::protocol::RateLimitWindow;
 use crate::protocol::TokenUsage;
 use crate::state::TaskKind;
+use crate::sync_chat_completions::chat_completions_sync;
 use crate::token_data::PlanType;
 use crate::util::backoff;
 use codex_otel::otel_event_manager::OtelEventManager;
@@ -143,8 +143,8 @@ impl ModelClient {
                     &self.provider,
                     &self.otel_event_manager,
                 )
-                    .await
-            },
+                .await
+            }
             WireApi::Chat => {
                 // Create the raw streaming connection first.
                 let response_stream = stream_chat_completions(

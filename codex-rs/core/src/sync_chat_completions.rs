@@ -12,14 +12,19 @@ use crate::model_family::ModelFamily;
 use crate::openai_tools::create_tools_json_for_chat_completions_api;
 use crate::util::backoff;
 use codex_otel::otel_event_manager::OtelEventManager;
-use codex_protocol::models::{ContentItem, ReasoningItemContent, ResponseItem};
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ReasoningItemContent;
+use codex_protocol::models::ResponseItem;
 use httpdate::parse_http_date;
 use regex_lite::Regex; // новый импорт
 use reqwest::StatusCode;
 use reqwest::header::HeaderMap;
-use serde_json::{Value, json};
+use serde_json::Value;
+use serde_json::json;
 use std::time::{SystemTime, UNIX_EPOCH}; // было Duration — расширяем
-use tracing::{debug, trace, warn}; // warn уже есть — оставь как есть
+use tracing::debug;
+use tracing::trace;
+use tracing::warn; // warn уже есть — оставь как есть
 
 /// Синхронный (нестриминговый) вызов Chat Completions API.
 pub(crate) async fn chat_completions_sync(
@@ -408,19 +413,32 @@ fn get_s<'a>(h: &'a HeaderMap, name: &str) -> &'a str {
 
 /// Только источники задержки (заголовки/тело/бэкофф) — "сырой" кандидат.
 /// НИЧЕГО не накапливает, не добавляет джиттер и минимумы.
-fn compute_retry_delay_sources(headers: &HeaderMap, body: &str, attempt: usize) -> (Duration, String) {
+fn compute_retry_delay_sources(
+    headers: &HeaderMap,
+    body: &str,
+    attempt: usize,
+) -> (Duration, String) {
     // 1) Тело: retry after Xs
     if let Some(secs) = parse_secs_from_body(body, r"retry after\s+([0-9]+(?:\.[0-9]+)?)s") {
-        return (Duration::from_millis((secs * 1000.0) as u64), format!("body retry-after ~{secs:.3}s"));
+        return (
+            Duration::from_millis((secs * 1000.0) as u64),
+            format!("body retry-after ~{secs:.3}s"),
+        );
     }
 
     // 2) Retry-After (сек/дата)
-    if let Some(v) = headers.get(reqwest::header::RETRY_AFTER).and_then(|v| v.to_str().ok()) {
+    if let Some(v) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+    {
         if let Ok(secs) = v.trim().parse::<u64>() {
             return (Duration::from_secs(secs), "Retry-After secs".to_string());
         }
         if let Ok(dt) = parse_http_date(v) {
-            if let (Ok(now), Ok(ts)) = (SystemTime::now().duration_since(UNIX_EPOCH), dt.duration_since(UNIX_EPOCH)) {
+            if let (Ok(now), Ok(ts)) = (
+                SystemTime::now().duration_since(UNIX_EPOCH),
+                dt.duration_since(UNIX_EPOCH),
+            ) {
                 if ts > now {
                     return (ts - now, "Retry-After date".to_string());
                 }
@@ -436,9 +454,15 @@ fn compute_retry_delay_sources(headers: &HeaderMap, body: &str, attempt: usize) 
     }
 
     // 4) x-ratelimit-reset = "секунд до окна"
-    if let Some(v) = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok()) {
+    if let Some(v) = headers
+        .get("x-ratelimit-reset")
+        .and_then(|v| v.to_str().ok())
+    {
         if let Ok(secs) = v.trim().parse::<u64>() {
-            return (Duration::from_secs(secs), "x-ratelimit-reset secs".to_string());
+            return (
+                Duration::from_secs(secs),
+                "x-ratelimit-reset secs".to_string(),
+            );
         }
     }
 
@@ -457,13 +481,18 @@ fn compute_retry_delay_sources(headers: &HeaderMap, body: &str, attempt: usize) 
 
     // 6) Тело: reset after Ys
     if let Some(secs) = parse_secs_from_body(body, r"reset after\s+([0-9]+(?:\.[0-9]+)?)s") {
-        return (Duration::from_millis((secs * 1000.0) as u64), format!("body reset-after ~{secs:.3}s"));
+        return (
+            Duration::from_millis((secs * 1000.0) as u64),
+            format!("body reset-after ~{secs:.3}s"),
+        );
     }
 
     // 7) fallback: ваш backoff
-    (backoff(attempt as u64), format!("backoff(attempt={attempt})"))
+    (
+        backoff(attempt as u64),
+        format!("backoff(attempt={attempt})"),
+    )
 }
-
 
 /// +~10% за попытку (1-я — без надбавки)
 fn inflate_by_attempt(d: Duration, attempt: usize) -> Duration {
@@ -489,7 +518,6 @@ fn fmt_system_time(t: SystemTime) -> String {
     // миллисекундная метка — читаемо в логах
     format!("epoch+{}ms", dur.as_millis())
 }
-
 
 fn dump_headers(h: &HeaderMap, max_pairs: usize, max_val_len: usize) -> String {
     let mut out = String::new();
@@ -523,11 +551,133 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+struct ParsedToolCall {
+    name: String,
+    arguments: String,
+    call_id: String,
+}
+
+fn parse_tool_calls_from_content(content: &str) -> Option<(Vec<ParsedToolCall>, String)> {
+    const TAG: &str = "<tool_call>";
+
+    let mut calls = Vec::new();
+    let mut remainder = String::new();
+    let mut cursor = 0;
+    let mut expecting_json = false;
+
+    while let Some(relative_pos) = content[cursor..].find(TAG) {
+        let absolute_pos = cursor + relative_pos;
+
+        if !expecting_json {
+            remainder.push_str(&content[cursor..absolute_pos]);
+            cursor = absolute_pos + TAG.len();
+            expecting_json = true;
+        } else {
+            let raw_json = &content[cursor..absolute_pos];
+            if let Some(parsed) = parse_tool_call_payload(raw_json) {
+                calls.push(parsed);
+            } else {
+                remainder.push_str(TAG);
+                remainder.push_str(raw_json);
+                remainder.push_str(TAG);
+            }
+            cursor = absolute_pos + TAG.len();
+            expecting_json = false;
+        }
+    }
+
+    if expecting_json {
+        remainder.push_str(TAG);
+        remainder.push_str(&content[cursor..]);
+    } else {
+        remainder.push_str(&content[cursor..]);
+    }
+
+    if calls.is_empty() {
+        None
+    } else {
+        Some((calls, remainder))
+    }
+}
+
+fn parse_tool_call_payload(raw_json: &str) -> Option<ParsedToolCall> {
+    let value: Value = serde_json::from_str(raw_json.trim()).ok()?;
+    let name = value.get("name")?.as_str()?.to_string();
+    let call_id = value
+        .get("id")
+        .or_else(|| value.get("call_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let arguments = match value.get("arguments") {
+        Some(Value::String(s)) => s.to_string(),
+        Some(other) => serde_json::to_string(other).unwrap_or_default(),
+        None => String::new(),
+    };
+
+    Some(ParsedToolCall {
+        name,
+        arguments,
+        call_id,
+    })
+}
+
 fn parse_secs_from_body(body: &str, pattern: &str) -> Option<f64> {
     let re = Regex::new(pattern).ok()?;
     let caps = re.captures(body)?;
     let m = caps.get(1)?;
     m.as_str().trim().parse::<f64>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn parses_tool_call_from_content_fallback() {
+        let body = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": [\"bash\", \"-lc\"], \"workdir\": \"/tmp\"}}\n<tool_call>",
+                    "tool_calls": []
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+
+        let first = rx.recv().await.expect("first event").expect("event ok");
+        match first {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(call_id, "");
+                assert_eq!(
+                    arguments,
+                    "{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let second = rx.recv().await.expect("completed").expect("event ok");
+        assert!(matches!(second, ResponseEvent::Completed { .. }));
+
+        assert!(rx.recv().await.is_none());
+    }
 }
 
 /// Разбор нестримингового ответа и эмиссия ваших ResponseEvent’ов.
@@ -587,7 +737,13 @@ async fn emit_sync_events_from_chat(
             }
         }
 
+        let mut message_content_text = message
+            .get("content")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
         // 2) tool_calls (если есть) → FunctionCall (одним событием на каждый вызов)
+        let mut emitted_tool_call = false;
         if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
             for tc in tool_calls {
                 if tc.get("type").and_then(|v| v.as_str()) == Some("function") {
@@ -614,17 +770,35 @@ async fn emit_sync_events_from_chat(
                         arguments,
                         call_id: call_id.to_string(),
                     };
+                    emitted_tool_call = true;
                     let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                 }
             }
         }
 
+        if !emitted_tool_call {
+            if let Some(content) = message_content_text.as_deref() {
+                if let Some((fallback_calls, remainder)) = parse_tool_calls_from_content(content) {
+                    for fallback_call in fallback_calls {
+                        let item = ResponseItem::FunctionCall {
+                            id: None,
+                            name: fallback_call.name,
+                            arguments: fallback_call.arguments,
+                            call_id: fallback_call.call_id,
+                        };
+                        let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                    }
+                    message_content_text = if remainder.is_empty() {
+                        None
+                    } else {
+                        Some(remainder)
+                    };
+                }
+            }
+        }
+
         // 3) content (если есть и не пустой) → Message(assistant)
-        if let Some(content) = message
-            .get("content")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-        {
+        if let Some(content) = message_content_text.as_ref().filter(|s| !s.is_empty()) {
             let item = ResponseItem::Message {
                 role: "assistant".to_string(),
                 content: vec![ContentItem::OutputText {
