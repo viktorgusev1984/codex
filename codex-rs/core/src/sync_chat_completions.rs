@@ -833,6 +833,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_tool_call_arguments_object() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_42",
+                        "type": "function",
+                        "function": {
+                            "name": "shell",
+                            "arguments": {
+                                "command": [
+                                    "find",
+                                    "/tmp/project",
+                                    "-name",
+                                    "gradlew",
+                                    "-o",
+                                    "-name",
+                                    "gradlew.bat"
+                                ],
+                                "workdir": "/tmp/project"
+                            }
+                        }
+                    }]
+                }
+            }]
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+
+        match rx.recv().await.expect("first event").expect("event ok") {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(call_id, "call_42");
+                assert_eq!(
+                    arguments,
+                    "{\"command\":[\"find\",\"/tmp/project\",\"-name\",\"gradlew\",\"-o\",\"-name\",\"gradlew.bat\"],\"workdir\":\"/tmp/project\"}"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let completed = rx.recv().await.expect("completed").expect("event ok");
+        assert!(matches!(completed, ResponseEvent::Completed { .. }));
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
     async fn parses_tool_call_from_nested_function_object() {
         let body = json!({
             "id": "chatcmpl-test",
@@ -944,7 +1000,6 @@ async fn emit_sync_events_from_chat(
         if let Some(tool_calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
             for tc in tool_calls {
                 if tc.get("type").and_then(|v| v.as_str()) == Some("function") {
-                    let call_id = tc.get("id").and_then(|v| v.as_str()).unwrap_or_default();
                     let func = tc
                         .get("function")
                         .and_then(|v| v.as_object())
@@ -954,12 +1009,21 @@ async fn emit_sync_events_from_chat(
                         .get("name")
                         .and_then(|v| v.as_str())
                         .unwrap_or_default();
-                    // OpenAI возвращает arguments как строку JSON — передаём как есть.
+
+                    let call_id = tc
+                        .get("id")
+                        .or_else(|| func.get("id"))
+                        .or_else(|| func.get("call_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+
                     let arguments = func
                         .get("arguments")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
+                        .map(|value| match value {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => serde_json::to_string(other).unwrap_or_default(),
+                        })
+                        .unwrap_or_default();
 
                     let item = ResponseItem::FunctionCall {
                         id: None,
