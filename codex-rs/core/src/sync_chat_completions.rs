@@ -4,7 +4,8 @@ use crate::ModelProviderInfo;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
-use crate::error::{CodexErr, ConnectionFailedError};
+use crate::error::CodexErr;
+use crate::error::ConnectionFailedError;
 use crate::error::Result;
 use crate::error::RetryLimitReachedError;
 use crate::error::UnexpectedResponseError;
@@ -260,11 +261,10 @@ pub(crate) async fn chat_completions_sync(
         // "min_p": 0
     });
 
-    if let Some(format) = response_format.clone() {
-        if let Some(obj) = payload.as_object_mut() {
+    if let Some(format) = response_format.clone()
+        && let Some(obj) = payload.as_object_mut() {
             obj.insert("response_format".to_string(), format);
         }
-    }
 
     debug!(
         "POST (sync) to {}: {}",
@@ -297,7 +297,7 @@ pub(crate) async fn chat_completions_sync(
                     Err(e) => {
                         return Err(CodexErr::Fatal(format!(
                             "failed to decode chat completion JSON: {e}"
-                        )))
+                        )));
                     }
                 };
                 trace!("chat_completions sync response: {body:#}");
@@ -402,7 +402,9 @@ pub(crate) async fn chat_completions_sync(
             }
             Err(e) => {
                 if attempt > max_retries {
-                    return Err(CodexErr::ConnectionFailed(ConnectionFailedError { source: e }));
+                    return Err(CodexErr::ConnectionFailed(ConnectionFailedError {
+                        source: e,
+                    }));
                 }
                 let delay = backoff(attempt as u64);
                 tokio::time::sleep(delay).await;
@@ -434,49 +436,41 @@ fn compute_retry_delay_sources(
         if let Ok(secs) = v.trim().parse::<u64>() {
             return (Duration::from_secs(secs), "Retry-After secs".to_string());
         }
-        if let Ok(dt) = parse_http_date(v) {
-            if let (Ok(now), Ok(ts)) = (
+        if let Ok(dt) = parse_http_date(v)
+            && let (Ok(now), Ok(ts)) = (
                 SystemTime::now().duration_since(UNIX_EPOCH),
                 dt.duration_since(UNIX_EPOCH),
-            ) {
-                if ts > now {
+            )
+                && ts > now {
                     return (ts - now, "Retry-After date".to_string());
                 }
-            }
-        }
     }
 
     // 3) retry-after-ms
-    if let Some(v) = headers.get("retry-after-ms").and_then(|v| v.to_str().ok()) {
-        if let Ok(ms) = v.trim().parse::<u64>() {
+    if let Some(v) = headers.get("retry-after-ms").and_then(|v| v.to_str().ok())
+        && let Ok(ms) = v.trim().parse::<u64>() {
             return (Duration::from_millis(ms), "retry-after-ms".to_string());
         }
-    }
 
     // 4) x-ratelimit-reset = "секунд до окна"
     if let Some(v) = headers
         .get("x-ratelimit-reset")
         .and_then(|v| v.to_str().ok())
-    {
-        if let Ok(secs) = v.trim().parse::<u64>() {
+        && let Ok(secs) = v.trim().parse::<u64>() {
             return (
                 Duration::from_secs(secs),
                 "x-ratelimit-reset secs".to_string(),
             );
         }
-    }
 
     // 5) x-ratelimit-reset-* как unix timestamp (сек)
     for k in ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"] {
-        if let Some(v) = headers.get(k).and_then(|v| v.to_str().ok()) {
-            if let Ok(ts) = v.trim().parse::<u64>() {
-                if let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) {
-                    if ts > now.as_secs() {
+        if let Some(v) = headers.get(k).and_then(|v| v.to_str().ok())
+            && let Ok(ts) = v.trim().parse::<u64>()
+                && let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH)
+                    && ts > now.as_secs() {
                         return (Duration::from_secs(ts - now.as_secs()), k.to_string());
                     }
-                }
-            }
-        }
     }
 
     // 6) Тело: reset after Ys
@@ -506,7 +500,7 @@ fn apply_deterministic_jitter(d: Duration, attempt: usize, pct: i64) -> Duration
 }
 
 fn mul_duration(d: Duration, pct: u64) -> Duration {
-    let ms = d.as_millis() as u128;
+    let ms = d.as_millis();
     let new_ms = ms.saturating_mul(pct as u128) / 100u128;
     Duration::from_millis(new_ms.min(u128::from(u64::MAX)) as u64)
 }
@@ -672,22 +666,53 @@ fn parse_tool_calls_from_content(content: &str) -> Option<(Vec<ParsedToolCall>, 
 
 fn parse_tool_call_payload(raw_json: &str) -> Option<ParsedToolCall> {
     let value: Value = serde_json::from_str(raw_json.trim()).ok()?;
-    let name = value.get("name")?.as_str()?.to_string();
-    let call_id = value
-        .get("id")
-        .or_else(|| value.get("call_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
 
-    // arguments может быть строкой или объектом — нормализуем к строке JSON
-    let arguments = match value.get("arguments") {
-        Some(Value::String(s)) => s.trim().to_string(),
-        Some(other) => serde_json::to_string(other).unwrap_or_default(),
-        None => String::new(),
-    };
+    if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+        let call_id = value
+            .get("id")
+            .or_else(|| value.get("call_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
 
-    Some(ParsedToolCall { name, arguments, call_id })
+        let arguments = match value.get("arguments") {
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            None => String::new(),
+        };
+
+        return Some(ParsedToolCall {
+            name: name.to_string(),
+            arguments,
+            call_id,
+        });
+    }
+
+    if let Some(function) = value.get("function").and_then(|v| v.as_object()) {
+        let name = function.get("name").and_then(|v| v.as_str())?;
+        let call_id = value
+            .get("id")
+            .or_else(|| value.get("call_id"))
+            .or_else(|| function.get("id"))
+            .or_else(|| function.get("call_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let arguments = match function.get("arguments") {
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            None => String::new(),
+        };
+
+        return Some(ParsedToolCall {
+            name: name.to_string(),
+            arguments,
+            call_id,
+        });
+    }
+
+    None
 }
 
 fn parse_secs_from_body(body: &str, pattern: &str) -> Option<f64> {
@@ -695,97 +720,6 @@ fn parse_secs_from_body(body: &str, pattern: &str) -> Option<f64> {
     let caps = re.captures(body)?;
     let m = caps.get(1)?;
     m.as_str().trim().parse::<f64>().ok()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[tokio::test]
-    async fn parses_tool_call_xml_like() {
-        let body = json!({
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}}\n</tool_call>",
-                "tool_calls": []
-            }
-        }]
-    });
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        emit_sync_events_from_chat(body, tx).await.unwrap();
-
-        let first = rx.recv().await.unwrap().unwrap();
-        if let ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { name, arguments, .. }) = first {
-            assert_eq!(name, "shell");
-            assert_eq!(arguments, "{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}");
-        } else { panic!("unexpected"); }
-    }
-
-    #[tokio::test]
-    async fn parses_tool_call_from_fenced_block() {
-        let body = json!({
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "some text\n```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"]}}\n```\nmore text",
-                "tool_calls": []
-            }
-        }]
-    });
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        emit_sync_events_from_chat(body, tx).await.unwrap();
-        let first = rx.recv().await.unwrap().unwrap();
-        assert!(matches!(first, ResponseEvent::OutputItemDone(ResponseItem::FunctionCall{..})));
-    }
-
-    #[tokio::test]
-    async fn parses_tool_call_from_content_fallback() {
-        let body = json!({
-            "id": "chatcmpl-test",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "test",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": [\"bash\", \"-lc\"], \"workdir\": \"/tmp\"}}\n<tool_call>",
-                    "tool_calls": []
-                },
-                "finish_reason": "stop"
-            }]
-        });
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        emit_sync_events_from_chat(body, tx).await.unwrap();
-
-        let first = rx.recv().await.expect("first event").expect("event ok");
-        match first {
-            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
-                name,
-                arguments,
-                call_id,
-                ..
-            }) => {
-                assert_eq!(name, "shell");
-                assert_eq!(call_id, "");
-                assert_eq!(
-                    arguments,
-                    "{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}"
-                );
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-
-        let second = rx.recv().await.expect("completed").expect("event ok");
-        assert!(matches!(second, ResponseEvent::Completed { .. }));
-
-        assert!(rx.recv().await.is_none());
-    }
 }
 
 /// Разбор нестримингового ответа и эмиссия ваших ResponseEvent’ов.
@@ -808,7 +742,7 @@ async fn emit_sync_events_from_chat(
         .unwrap_or_default();
 
     // Мы обрабатываем только первый choice (как и большинство интеграций).
-    if let Some(choice) = choices.get(0) {
+    if let Some(choice) = choices.first() {
         // Reasoning может лежать в choice.message.reasoning (строка или объект).
         let message = choice.get("message").cloned().unwrap_or(json!({}));
 
@@ -824,13 +758,12 @@ async fn emit_sync_events_from_chat(
                     encrypted_content: None,
                 };
                 let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
-            } else if let Some(obj) = reasoning_val.as_object() {
-                if let Some(s) = obj
+            } else if let Some(obj) = reasoning_val.as_object()
+                && let Some(s) = obj
                     .get("text")
                     .and_then(|v| v.as_str())
                     .or_else(|| obj.get("content").and_then(|v| v.as_str()))
-                {
-                    if !s.is_empty() {
+                    && !s.is_empty() {
                         let item = ResponseItem::Reasoning {
                             id: String::new(),
                             summary: Vec::new(),
@@ -841,14 +774,12 @@ async fn emit_sync_events_from_chat(
                         };
                         let _ = tx.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                     }
-                }
-            }
         }
 
         let mut message_content_text = message
             .get("content")
             .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .map(std::string::ToString::to_string);
 
         // 2) tool_calls (если есть) → FunctionCall (одним событием на каждый вызов)
         let mut emitted_tool_call = false;
@@ -884,9 +815,9 @@ async fn emit_sync_events_from_chat(
             }
         }
 
-        if !emitted_tool_call {
-            if let Some(content) = message_content_text.as_deref() {
-                if let Some((fallback_calls, remainder)) = parse_tool_calls_from_content(content) {
+        if !emitted_tool_call
+            && let Some(content) = message_content_text.as_deref()
+                && let Some((fallback_calls, remainder)) = parse_tool_calls_from_content(content) {
                     for fallback_call in fallback_calls {
                         let item = ResponseItem::FunctionCall {
                             id: None,
@@ -902,8 +833,6 @@ async fn emit_sync_events_from_chat(
                         Some(remainder)
                     };
                 }
-            }
-        }
 
         // 3) content (если есть и не пустой) → Message(assistant)
         if let Some(content) = message_content_text.as_ref().filter(|s| !s.is_empty()) {
@@ -927,4 +856,185 @@ async fn emit_sync_events_from_chat(
         .await;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn parses_tool_call_xml_like() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}}\n</tool_call>",
+                    "tool_calls": []
+                }
+            }]
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+
+        let first = rx.recv().await.unwrap().unwrap();
+        if let ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+            name, arguments, ..
+        }) = first
+        {
+            assert_eq!(name, "shell");
+            assert_eq!(
+                arguments,
+                "{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}"
+            );
+        } else {
+            panic!("unexpected");
+        }
+    }
+
+    #[tokio::test]
+    async fn parses_tool_call_from_fenced_block() {
+        let body = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "some text\n```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"]}}\n```\nmore text",
+                    "tool_calls": []
+                }
+            }]
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(matches!(
+            first,
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn parses_tool_call_from_content_fallback() {
+        let tool_arguments = json!({
+            "command": [
+                "bash",
+                "-lc",
+                "cat > docs-to-sign-java/pom.xml"
+            ],
+            "workdir": "/tmp",
+            "stdin": "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"\n    <modelVersion>4.0.0</modelVersion>\n</project>\n"
+        });
+        let tool_payload = json!({
+            "id": "call_sync_shell_1",
+            "name": "shell",
+            "arguments": tool_arguments
+        });
+        let content = format!("<tool_call>\n{tool_payload}\n</tool_call>");
+
+        let body = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": []
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+
+        let first = rx.recv().await.expect("first event").expect("event ok");
+        match first {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(call_id, "call_sync_shell_1");
+
+                let parsed: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+                assert_eq!(
+                    parsed["command"],
+                    json!(["bash", "-lc", "cat > docs-to-sign-java/pom.xml"])
+                );
+                assert_eq!(parsed["workdir"], json!("/tmp"));
+                assert_eq!(
+                    parsed["stdin"].as_str().unwrap(),
+                    "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"\n    <modelVersion>4.0.0</modelVersion>\n</project>\n"
+                );
+
+                let shell_params: codex_protocol::models::ShellToolCallParams =
+                    serde_json::from_str(&arguments).expect("shell params should parse");
+                assert_eq!(
+                    shell_params.command,
+                    vec![
+                        "bash".to_string(),
+                        "-lc".to_string(),
+                        "cat > docs-to-sign-java/pom.xml".to_string()
+                    ]
+                );
+                assert_eq!(shell_params.workdir, Some("/tmp".to_string()));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let second = rx.recv().await.expect("completed").expect("event ok");
+        assert!(matches!(second, ResponseEvent::Completed { .. }));
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_tool_call_from_nested_function_object() {
+        let body = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": r#"<tool_call>
+{"id": "call_123", "type": "function", "function": {"name": "shell", "arguments": "{\"command\":[\"bash\",\"-lc\"]}"}}
+</tool_call>"#,
+                    "tool_calls": []
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+
+        let first = rx.recv().await.expect("first event").expect("event ok");
+        match first {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(call_id, "call_123");
+                assert_eq!(arguments, "{\"command\":[\"bash\",\"-lc\"]}");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let second = rx.recv().await.expect("completed").expect("event ok");
+        assert!(matches!(second, ResponseEvent::Completed { .. }));
+
+        assert!(rx.recv().await.is_none());
+    }
 }
