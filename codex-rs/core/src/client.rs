@@ -144,6 +144,7 @@ impl ModelClient {
                     &self.client,
                     &self.provider,
                     &self.otel_event_manager,
+                    &self.config.sync_chat_completions,
                 )
                 .await
             }
