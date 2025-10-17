@@ -4,7 +4,7 @@ use crate::ModelProviderInfo;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
-use crate::error::CodexErr;
+use crate::error::{CodexErr, ConnectionFailedError};
 use crate::error::Result;
 use crate::error::RetryLimitReachedError;
 use crate::error::UnexpectedResponseError;
@@ -254,10 +254,10 @@ pub(crate) async fn chat_completions_sync(
         "messages": messages,
         "stream": false,
         "tools": tools_json,
-        "temperature": 0.1,
-        "top_p": 0.8,
-        "top_k":  20,
-        "min_p": 0
+        "temperature": 0.2,
+        // "top_p": 0.8,
+        // "top_k":  20,
+        // "min_p": 0
     });
 
     if let Some(format) = response_format.clone() {
@@ -294,7 +294,11 @@ pub(crate) async fn chat_completions_sync(
             Ok(resp) if resp.status().is_success() => {
                 let body: Value = match resp.json().await {
                     Ok(v) => v,
-                    Err(e) => return Err(CodexErr::Reqwest(e)),
+                    Err(e) => {
+                        return Err(CodexErr::Fatal(format!(
+                            "failed to decode chat completion JSON: {e}"
+                        )))
+                    }
                 };
                 trace!("chat_completions sync response: {body:#}");
 
@@ -398,17 +402,13 @@ pub(crate) async fn chat_completions_sync(
             }
             Err(e) => {
                 if attempt > max_retries {
-                    return Err(e.into());
+                    return Err(CodexErr::ConnectionFailed(ConnectionFailedError { source: e }));
                 }
                 let delay = backoff(attempt as u64);
                 tokio::time::sleep(delay).await;
             }
         }
     }
-}
-
-fn get_s<'a>(h: &'a HeaderMap, name: &str) -> &'a str {
-    h.get(name).and_then(|v| v.to_str().ok()).unwrap_or("")
 }
 
 /// Только источники задержки (заголовки/тело/бэкофф) — "сырой" кандидат.
@@ -558,39 +558,109 @@ struct ParsedToolCall {
 }
 
 fn parse_tool_calls_from_content(content: &str) -> Option<(Vec<ParsedToolCall>, String)> {
-    const TAG: &str = "<tool_call>";
+    // 1) Сначала — нормальный XML-подобный вариант: <tool_call> … </tool_call>
+    //   Берём все непересекающиеся пары; флаг (?s) — точка матчится на \n.
+    let re_closed = Regex::new(r"(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>").ok();
 
-    let mut calls = Vec::new();
+    let mut calls = Vec::<ParsedToolCall>::new();
     let mut remainder = String::new();
-    let mut cursor = 0;
+
+    if let Some(re) = &re_closed {
+        let mut last_end = 0usize;
+        for m in re.captures_iter(content) {
+            // Текст до тега — в остаток
+            if let Some(mat) = m.get(0) {
+                let start = mat.start();
+                if start > last_end {
+                    remainder.push_str(&content[last_end..start]);
+                }
+                last_end = mat.end();
+            }
+            // Сам JSON
+            if let Some(json_m) = m.get(1) {
+                if let Some(parsed) = parse_tool_call_payload(json_m.as_str()) {
+                    calls.push(parsed);
+                } else {
+                    // Если JSON битый — вернём как есть в остатке
+                    if let Some(mat) = m.get(0) {
+                        remainder.push_str(mat.as_str());
+                    }
+                }
+            }
+        }
+        // Хвост после последнего совпадения
+        if last_end < content.len() {
+            remainder.push_str(&content[last_end..]);
+        }
+
+        if !calls.is_empty() {
+            return Some((calls, remainder));
+        }
+        // если пусто — падаем во 2-й режим
+        remainder.clear();
+    }
+
+    // 2) Режим старой разметки: <tool_call> JSON <tool_call>
+    const TAG: &str = "<tool_call>";
+    let mut cursor = 0usize;
     let mut expecting_json = false;
-
-    while let Some(relative_pos) = content[cursor..].find(TAG) {
-        let absolute_pos = cursor + relative_pos;
-
+    while let Some(rel) = content[cursor..].find(TAG) {
+        let abs = cursor + rel;
         if !expecting_json {
-            remainder.push_str(&content[cursor..absolute_pos]);
-            cursor = absolute_pos + TAG.len();
+            // префикс — в остаток
+            remainder.push_str(&content[cursor..abs]);
+            cursor = abs + TAG.len();
             expecting_json = true;
         } else {
-            let raw_json = &content[cursor..absolute_pos];
+            // между тегами — JSON
+            let raw_json = &content[cursor..abs];
             if let Some(parsed) = parse_tool_call_payload(raw_json) {
                 calls.push(parsed);
             } else {
+                // вернуть как есть, если не распарсили
                 remainder.push_str(TAG);
                 remainder.push_str(raw_json);
                 remainder.push_str(TAG);
             }
-            cursor = absolute_pos + TAG.len();
+            cursor = abs + TAG.len();
             expecting_json = false;
         }
     }
-
+    // Если остались “хвосты”
     if expecting_json {
         remainder.push_str(TAG);
         remainder.push_str(&content[cursor..]);
     } else {
         remainder.push_str(&content[cursor..]);
+    }
+
+    if !calls.is_empty() {
+        return Some((calls, remainder));
+    }
+
+    // 3) Запасной путь: блоки ```tool_call / ```json
+    let re_fence = Regex::new(r"(?s)```(?:tool_call|json)\s*(\{.*?\})\s*```").ok();
+    if let Some(re) = &re_fence {
+        let mut last_end = 0usize;
+        for m in re.captures_iter(content) {
+            if let Some(mat) = m.get(0) {
+                let start = mat.start();
+                if start > last_end {
+                    remainder.push_str(&content[last_end..start]);
+                }
+                last_end = mat.end();
+            }
+            if let Some(json_m) = m.get(1) {
+                if let Some(parsed) = parse_tool_call_payload(json_m.as_str()) {
+                    calls.push(parsed);
+                } else if let Some(mat) = m.get(0) {
+                    remainder.push_str(mat.as_str());
+                }
+            }
+        }
+        if last_end < content.len() {
+            remainder.push_str(&content[last_end..]);
+        }
     }
 
     if calls.is_empty() {
@@ -609,17 +679,15 @@ fn parse_tool_call_payload(raw_json: &str) -> Option<ParsedToolCall> {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
+
+    // arguments может быть строкой или объектом — нормализуем к строке JSON
     let arguments = match value.get("arguments") {
-        Some(Value::String(s)) => s.to_string(),
+        Some(Value::String(s)) => s.trim().to_string(),
         Some(other) => serde_json::to_string(other).unwrap_or_default(),
         None => String::new(),
     };
 
-    Some(ParsedToolCall {
-        name,
-        arguments,
-        call_id,
-    })
+    Some(ParsedToolCall { name, arguments, call_id })
 }
 
 fn parse_secs_from_body(body: &str, pattern: &str) -> Option<f64> {
@@ -633,6 +701,46 @@ fn parse_secs_from_body(body: &str, pattern: &str) -> Option<f64> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn parses_tool_call_xml_like() {
+        let body = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}}\n</tool_call>",
+                "tool_calls": []
+            }
+        }]
+    });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+
+        let first = rx.recv().await.unwrap().unwrap();
+        if let ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { name, arguments, .. }) = first {
+            assert_eq!(name, "shell");
+            assert_eq!(arguments, "{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}");
+        } else { panic!("unexpected"); }
+    }
+
+    #[tokio::test]
+    async fn parses_tool_call_from_fenced_block() {
+        let body = json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "some text\n```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"]}}\n```\nmore text",
+                "tool_calls": []
+            }
+        }]
+    });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+        let first = rx.recv().await.unwrap().unwrap();
+        assert!(matches!(first, ResponseEvent::OutputItemDone(ResponseItem::FunctionCall{..})));
+    }
 
     #[tokio::test]
     async fn parses_tool_call_from_content_fallback() {

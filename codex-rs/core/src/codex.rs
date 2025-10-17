@@ -916,7 +916,6 @@ impl Session {
             duration,
             exit_code,
             timed_out: _,
-            ..
         } = output;
         // Send full stdout/stderr to clients; do not truncate.
         let stdout = stdout.text.clone();
@@ -981,27 +980,14 @@ impl Session {
         let sub_id = context.sub_id.clone();
         let call_id = context.call_id.clone();
 
-        let begin_turn_diff = turn_diff_tracker.clone();
-        let begin_context = context.clone();
-        let session = self;
+        self.on_exec_command_begin(turn_diff_tracker.clone(), context.clone())
+            .await;
+
         let result = self
             .services
             .executor
-            .run(request, self, approval_policy, &context, move || {
-                let turn_diff = begin_turn_diff.clone();
-                let ctx = begin_context.clone();
-                async move {
-                    session.on_exec_command_begin(turn_diff, ctx).await;
-                }
-            })
+            .run(request, self, approval_policy, &context)
             .await;
-
-        if matches!(
-            &result,
-            Err(ExecError::Function(FunctionCallError::Denied(_)))
-        ) {
-            return result;
-        }
 
         let normalized = normalize_exec_result(&result);
         let borrowed = normalized.event_output();
@@ -2276,8 +2262,7 @@ async fn try_run_turn(
                             response: Some(response),
                         });
                     }
-                    Err(FunctionCallError::RespondToModel(message))
-                    | Err(FunctionCallError::Denied(message)) => {
+                    Err(FunctionCallError::RespondToModel(message)) => {
                         let response = ResponseInputItem::FunctionCallOutput {
                             call_id: String::new(),
                             output: FunctionCallOutputPayload {

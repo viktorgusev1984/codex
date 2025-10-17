@@ -60,9 +60,5 @@ pub mod errors {
         pub(crate) fn rejection(msg: impl Into<String>) -> Self {
             FunctionCallError::RespondToModel(msg.into()).into()
         }
-
-        pub(crate) fn denied(msg: impl Into<String>) -> Self {
-            FunctionCallError::Denied(msg.into()).into()
-        }
     }
 }
