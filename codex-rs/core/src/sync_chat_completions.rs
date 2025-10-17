@@ -4,7 +4,8 @@ use crate::ModelProviderInfo;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
-use crate::error::{CodexErr, ConnectionFailedError};
+use crate::error::CodexErr;
+use crate::error::ConnectionFailedError;
 use crate::error::Result;
 use crate::error::RetryLimitReachedError;
 use crate::error::UnexpectedResponseError;
@@ -297,7 +298,7 @@ pub(crate) async fn chat_completions_sync(
                     Err(e) => {
                         return Err(CodexErr::Fatal(format!(
                             "failed to decode chat completion JSON: {e}"
-                        )))
+                        )));
                     }
                 };
                 trace!("chat_completions sync response: {body:#}");
@@ -402,7 +403,9 @@ pub(crate) async fn chat_completions_sync(
             }
             Err(e) => {
                 if attempt > max_retries {
-                    return Err(CodexErr::ConnectionFailed(ConnectionFailedError { source: e }));
+                    return Err(CodexErr::ConnectionFailed(ConnectionFailedError {
+                        source: e,
+                    }));
                 }
                 let delay = backoff(attempt as u64);
                 tokio::time::sleep(delay).await;
@@ -672,22 +675,53 @@ fn parse_tool_calls_from_content(content: &str) -> Option<(Vec<ParsedToolCall>, 
 
 fn parse_tool_call_payload(raw_json: &str) -> Option<ParsedToolCall> {
     let value: Value = serde_json::from_str(raw_json.trim()).ok()?;
-    let name = value.get("name")?.as_str()?.to_string();
-    let call_id = value
-        .get("id")
-        .or_else(|| value.get("call_id"))
-        .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
 
-    // arguments может быть строкой или объектом — нормализуем к строке JSON
-    let arguments = match value.get("arguments") {
-        Some(Value::String(s)) => s.trim().to_string(),
-        Some(other) => serde_json::to_string(other).unwrap_or_default(),
-        None => String::new(),
-    };
+    if let Some(name) = value.get("name").and_then(|v| v.as_str()) {
+        let call_id = value
+            .get("id")
+            .or_else(|| value.get("call_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
 
-    Some(ParsedToolCall { name, arguments, call_id })
+        let arguments = match value.get("arguments") {
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            None => String::new(),
+        };
+
+        return Some(ParsedToolCall {
+            name: name.to_string(),
+            arguments,
+            call_id,
+        });
+    }
+
+    if let Some(function) = value.get("function").and_then(|v| v.as_object()) {
+        let name = function.get("name").and_then(|v| v.as_str())?;
+        let call_id = value
+            .get("id")
+            .or_else(|| value.get("call_id"))
+            .or_else(|| function.get("id"))
+            .or_else(|| function.get("call_id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+
+        let arguments = match function.get("arguments") {
+            Some(Value::String(s)) => s.trim().to_string(),
+            Some(other) => serde_json::to_string(other).unwrap_or_default(),
+            None => String::new(),
+        };
+
+        return Some(ParsedToolCall {
+            name: name.to_string(),
+            arguments,
+            call_id,
+        });
+    }
+
+    None
 }
 
 fn parse_secs_from_body(body: &str, pattern: &str) -> Option<f64> {
@@ -705,41 +739,52 @@ mod tests {
     #[tokio::test]
     async fn parses_tool_call_xml_like() {
         let body = json!({
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}}\n</tool_call>",
-                "tool_calls": []
-            }
-        }]
-    });
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}}\n</tool_call>",
+                    "tool_calls": []
+                }
+            }]
+        });
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         emit_sync_events_from_chat(body, tx).await.unwrap();
 
         let first = rx.recv().await.unwrap().unwrap();
-        if let ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { name, arguments, .. }) = first {
+        if let ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+            name, arguments, ..
+        }) = first
+        {
             assert_eq!(name, "shell");
-            assert_eq!(arguments, "{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}");
-        } else { panic!("unexpected"); }
+            assert_eq!(
+                arguments,
+                "{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}"
+            );
+        } else {
+            panic!("unexpected");
+        }
     }
 
     #[tokio::test]
     async fn parses_tool_call_from_fenced_block() {
         let body = json!({
-        "choices": [{
-            "message": {
-                "role": "assistant",
-                "content": "some text\n```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"]}}\n```\nmore text",
-                "tool_calls": []
-            }
-        }]
-    });
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "some text\n```tool_call\n{\"name\":\"shell\",\"arguments\":{\"command\":[\"bash\",\"-lc\"]}}\n```\nmore text",
+                    "tool_calls": []
+                }
+            }]
+        });
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         emit_sync_events_from_chat(body, tx).await.unwrap();
         let first = rx.recv().await.unwrap().unwrap();
-        assert!(matches!(first, ResponseEvent::OutputItemDone(ResponseItem::FunctionCall{..})));
+        assert!(matches!(
+            first,
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall { .. })
+        ));
     }
 
     #[tokio::test]
@@ -777,6 +822,50 @@ mod tests {
                     arguments,
                     "{\"command\":[\"bash\",\"-lc\"],\"workdir\":\"/tmp\"}"
                 );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+
+        let second = rx.recv().await.expect("completed").expect("event ok");
+        assert!(matches!(second, ResponseEvent::Completed { .. }));
+
+        assert!(rx.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn parses_tool_call_from_nested_function_object() {
+        let body = json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": r#"<tool_call>
+{"id": "call_123", "type": "function", "function": {"name": "shell", "arguments": "{\"command\":[\"bash\",\"-lc\"]}"}}
+</tool_call>"#,
+                    "tool_calls": []
+                },
+                "finish_reason": "stop"
+            }]
+        });
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        emit_sync_events_from_chat(body, tx).await.unwrap();
+
+        let first = rx.recv().await.expect("first event").expect("event ok");
+        match first {
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                name,
+                arguments,
+                call_id,
+                ..
+            }) => {
+                assert_eq!(name, "shell");
+                assert_eq!(call_id, "call_123");
+                assert_eq!(arguments, "{\"command\":[\"bash\",\"-lc\"]}");
             }
             other => panic!("unexpected event: {other:?}"),
         }
