@@ -16,6 +16,8 @@ use crate::config_types::ReasoningSummaryFormat;
 use crate::config_types::SandboxWorkspaceWrite;
 use crate::config_types::ShellEnvironmentPolicy;
 use crate::config_types::ShellEnvironmentPolicyToml;
+use crate::config_types::SyncChatCompletionsConfig;
+use crate::config_types::SyncChatCompletionsToml;
 use crate::config_types::Tui;
 use crate::config_types::UriBasedFileOpener;
 use crate::features::Feature;
@@ -98,6 +100,9 @@ pub struct Config {
 
     /// Info needed to make an API request to the model.
     pub model_provider: ModelProviderInfo,
+
+    /// Parameters for the synchronous Chat Completions API.
+    pub sync_chat_completions: SyncChatCompletionsConfig,
 
     /// Approval policy for executing commands.
     pub approval_policy: AskForApproval,
@@ -839,6 +844,10 @@ pub struct ConfigToml {
     /// Maximum number of output tokens.
     pub model_max_output_tokens: Option<i64>,
 
+    /// Parameters for the synchronous Chat Completions API.
+    #[serde(default)]
+    pub sync_chat_completions: SyncChatCompletionsToml,
+
     /// Token usage threshold triggering auto-compaction of conversation history.
     pub model_auto_compact_token_limit: Option<i64>,
 
@@ -1272,6 +1281,7 @@ impl Config {
         let shell_environment_policy = cfg.shell_environment_policy.into();
 
         let history = cfg.history.unwrap_or_default();
+        let sync_chat_completions = cfg.sync_chat_completions.clone().into();
 
         let include_apply_patch_tool_flag = features.enabled(Feature::ApplyPatchFreeform);
         let include_view_image_tool_flag = features.enabled(Feature::ViewImageTool);
@@ -1349,6 +1359,7 @@ impl Config {
             model_auto_compact_token_limit,
             model_provider_id,
             model_provider,
+            sync_chat_completions,
             cwd: resolved_cwd,
             approval_policy,
             sandbox_policy,
@@ -2945,6 +2956,7 @@ model_verbosity = "high"
                 did_user_set_custom_approval_policy_or_sandbox_mode: true,
                 shell_environment_policy: ShellEnvironmentPolicy::default(),
                 user_instructions: None,
+                sync_chat_completions: SyncChatCompletionsConfig::default(),
                 notify: None,
                 cwd: fixture.cwd(),
                 mcp_servers: HashMap::new(),
@@ -3014,6 +3026,7 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             user_instructions: None,
+            sync_chat_completions: SyncChatCompletionsConfig::default(),
             notify: None,
             cwd: fixture.cwd(),
             mcp_servers: HashMap::new(),
@@ -3098,6 +3111,7 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             user_instructions: None,
+            sync_chat_completions: SyncChatCompletionsConfig::default(),
             notify: None,
             cwd: fixture.cwd(),
             mcp_servers: HashMap::new(),
@@ -3168,6 +3182,7 @@ model_verbosity = "high"
             did_user_set_custom_approval_policy_or_sandbox_mode: true,
             shell_environment_policy: ShellEnvironmentPolicy::default(),
             user_instructions: None,
+            sync_chat_completions: SyncChatCompletionsConfig::default(),
             notify: None,
             cwd: fixture.cwd(),
             mcp_servers: HashMap::new(),

@@ -5,6 +5,7 @@ use crate::tools::handlers::apply_patch::ApplyPatchToolType;
 /// with this content.
 const BASE_INSTRUCTIONS: &str = include_str!("../prompt.md");
 const GPT_5_CODEX_INSTRUCTIONS: &str = include_str!("../gpt_5_codex_prompt.md");
+const QWEN_INSTRUCTIONS: &str = include_str!("../qwen_tgpt_prompt.md");
 
 /// A model family is a group of models that share certain characteristics.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -160,6 +161,22 @@ pub fn find_family_for_model(slug: &str) -> Option<ModelFamily> {
             slug, "gpt-5",
             supports_reasoning_summaries: true,
             needs_special_apply_patch_instructions: true,
+        )
+    } else if slug.starts_with("tgpt/qwen") {
+        model_family!(
+            slug, slug,
+            supports_reasoning_summaries: true,
+            reasoning_summary_format: ReasoningSummaryFormat::Experimental,
+            base_instructions: QWEN_INSTRUCTIONS.to_string(),
+            apply_patch_tool_type: Some(ApplyPatchToolType::Function),
+            experimental_supported_tools: vec![
+                "grep_files".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+                "test_sync_tool".to_string(),
+                "edit".to_string(),
+            ],
+            effective_context_window_percent: 60,
         )
     } else {
         None

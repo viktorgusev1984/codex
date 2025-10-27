@@ -37,7 +37,7 @@ codex-stdio-to-uds = { workspace = true }
 codex-tui = { workspace = true }
 ctor = { workspace = true }
 owo-colors = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 supports-color = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",

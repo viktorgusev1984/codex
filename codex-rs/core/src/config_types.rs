@@ -15,6 +15,61 @@ use serde::de::Error as SerdeError;
 
 pub const DEFAULT_OTEL_ENVIRONMENT: &str = "dev";
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncChatCompletionsConfig {
+    pub temperature: f64,
+    pub top_p: f64,
+    pub top_k: Option<u32>,
+    pub min_p: f64,
+}
+
+impl Default for SyncChatCompletionsConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.6,
+            top_p: 0.8,
+            top_k: Some(20),
+            min_p: 0.0,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct SyncChatCompletionsToml {
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+}
+
+impl From<SyncChatCompletionsToml> for SyncChatCompletionsConfig {
+    fn from(value: SyncChatCompletionsToml) -> Self {
+        let mut config = SyncChatCompletionsConfig::default();
+
+        if let Some(temperature) = value.temperature {
+            config.temperature = temperature;
+        }
+
+        if let Some(top_p) = value.top_p {
+            config.top_p = top_p;
+        }
+
+        if let Some(top_k) = value.top_k {
+            config.top_k = if top_k == 0 { None } else { Some(top_k) };
+        }
+
+        if let Some(min_p) = value.min_p {
+            config.min_p = min_p;
+        }
+
+        config
+    }
+}
+
 #[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct McpServerConfig {
     #[serde(flatten)]

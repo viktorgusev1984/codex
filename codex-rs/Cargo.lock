@@ -1080,6 +1080,7 @@ dependencies = [
  "eventsource-stream",
  "futures",
  "http",
+ "httpdate",
  "indexmap 2.10.0",
  "landlock",
  "libc",

@@ -57,6 +57,7 @@ use crate::protocol::RateLimitSnapshot;
 use crate::protocol::RateLimitWindow;
 use crate::protocol::TokenUsage;
 use crate::state::TaskKind;
+use crate::sync_chat_completions::chat_completions_sync;
 use crate::token_data::PlanType;
 use crate::tools::spec::create_tools_json_for_responses_api;
 use crate::util::backoff;
@@ -149,6 +150,17 @@ impl ModelClient {
     ) -> Result<ResponseStream> {
         match self.provider.wire_api {
             WireApi::Responses => self.stream_responses(prompt, task_kind).await,
+            WireApi::SyncChat => {
+                chat_completions_sync(
+                    prompt,
+                    &self.config.model_family,
+                    &self.client,
+                    &self.provider,
+                    &self.otel_event_manager,
+                    &self.config.sync_chat_completions,
+                )
+                .await
+            }
             WireApi::Chat => {
                 // Create the raw streaming connection first.
                 let response_stream = stream_chat_completions(

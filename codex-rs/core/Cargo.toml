@@ -45,7 +45,7 @@ rand = { workspace = true }
 regex-lite = { workspace = true }
 reqwest = { workspace = true, features = ["json", "stream"] }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 sha1 = { workspace = true }
 shlex = { workspace = true }
 similar = { workspace = true }
@@ -75,6 +75,7 @@ tree-sitter-bash = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
 which = { workspace = true }
 wildmatch = { workspace = true }
+httpdate = "1.0.3"
 
 
 [target.'cfg(target_os = "linux")'.dependencies]

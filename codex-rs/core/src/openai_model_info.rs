@@ -82,6 +82,18 @@ pub(crate) fn get_model_info(model_family: &ModelFamily) -> Option<ModelInfo> {
             Some(ModelInfo::new(CONTEXT_WINDOW_272K, MAX_OUTPUT_TOKENS_128K))
         }
 
+        _ if slug.starts_with("tgpt/qwen3-235b") => Some(ModelInfo {
+            context_window: 262_000,
+            max_output_tokens: 16_384,
+            auto_compact_token_limit: Some(262_144),
+        }),
+
+        _ if slug.starts_with("tgpt/qwen3-coder-480b") => Some(ModelInfo {
+            context_window: 272_000,
+            max_output_tokens: 128_000,
+            auto_compact_token_limit: Some(350_000),
+        }),
+
         _ => None,
     }
 }
